@@ -1,0 +1,21 @@
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+node_modules/
+*.log
+.env
+
+# eval suite runtime output (transcripts, grading, benchmarks)
+evals/workspace/
+evals/archive/
+
+# skill-creator's run_eval.py drops temp command files here
+.claude/commands/
+
+# Python
+__pycache__/
+*.pyc
+
+# Temp
+evals
