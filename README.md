@@ -2,25 +2,22 @@
 
 A collection of AI agent skills I use daily. Open source, MIT licensed.
 
-## LISA Loop
+## Skills
 
-**Learn → Inspect → Sift → Answer** — a timed research protocol that forces AI agents into deliberate thinking instead of shallow first-result answers.
+| Skill | Description |
+|-------|-------------|
+| [lisa-loop](skills/lisa-loop/) | Timed deep research protocol (LISA: Learn → Inspect → Sift → Answer). Forces LLMs into System 2 thinking with enforced time budgets. |
+| [plan-dotnet-app](skills/plan-dotnet-app/) | Generate a build plan for .NET 10 Blazor Web Apps with Blazor Blueprint, EF Core, Playwright testing, and GitHub Actions CI. |
 
-LLMs default to grabbing the first plausible answer and stopping. LISA enforces a minimum time budget (verified via bash timestamps) so the agent actually has to research before it responds.
-
-**What it does:**
-- Sets a time floor — the agent can't answer before the budget runs out
-- Forces multiple search passes and hypothesis formation
-- Requires source citations with exact quotes and URLs
-- Catches shortcuts and surface-level synthesis
-
-**Install:**
+## Install
 
 ```bash
+# Install a specific skill
 npx skills@latest add rquintino/skills --skill lisa-loop
+npx skills@latest add rquintino/skills --skill plan-dotnet-app
 ```
 
-Or just copy `skills/lisa-loop/SKILL.md` into `~/.claude/skills/lisa-loop/`.
+Or copy the relevant `skills/<name>/SKILL.md` into `~/.claude/skills/<name>/`.
 
 Works with Claude Code, Claude.ai, Codex, Cursor, Gemini CLI, and anything that reads SKILL.md.
 
