@@ -5,6 +5,7 @@ Thumbs.db
 node_modules/
 *.log
 .env
+.obsidian
 
 # eval suite runtime output (transcripts, grading, benchmarks)
 evals/workspace/

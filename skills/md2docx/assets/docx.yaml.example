@@ -1,0 +1,9 @@
+title: "Document Title"
+subtitle: "Subtitle text"
+author: "Author Name"
+subject: "Document subject"
+lang: en
+output: output.docx
+template: template.docx
+toc-depth: 2
+summary: true

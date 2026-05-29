@@ -110,7 +110,7 @@ Once approved, guide the user:
 
 > Generated: {YYYY-MM-DD}
 > Stack: .NET 10 · Blazor Web App · Blazor Blueprint (shadcn/ui) · EF Core + SQLite · Playwright · GitHub Actions
-> Skill: `plan-dotnet-app` v{version} — https://github.com/rquintino/skills
+> Skill: `plan-dotnet-app` v{version} — https://github.com/rquintino/claude-code-config
 >
 > **Self-contained.** Execute with a coding agent using orchestrator/sub-agent
 > pattern. No internet access required.
@@ -480,7 +480,7 @@ sed -n '/<!-- §phase-6 -->/,/<!-- §phase-7 -->/p' tasks/current/{app-slug}/pla
 Read the ACTUAL codebase. All content must reference real paths/entities.
 
 1. **`AGENTS.md`** (root) — structure, conventions, commands, seed data, task workflow
-2. **`README.md`** — title, badges, architecture, quick start, commands. Include a **Screenshots** section with markdown images for each page (`![Home](docs/screenshots/home.png)`, etc.) so the repo landing page shows the app visually. Add a footer line: `> Scaffolded by [plan-dotnet-app](https://github.com/rquintino/skills/plan-dotnet-app/SKILL/plan-dotnet-app/SKILL.md) v{version}`
+2. **`README.md`** — title, badges, architecture, quick start, commands. Include a **Screenshots** section with markdown images for each page (`![Home](docs/screenshots/home.png)`, etc.) so the repo landing page shows the app visually. Add a footer line: `> Scaffolded by [plan-dotnet-app](https://github.com/rquintino/claude-code-config/blob/main/skills/plan-dotnet-app/SKILL.md) v{version}`
 3. **`.github/instructions/blazor.instructions.md`** (applyTo: `**/*.razor`) — use Blazor Blueprint components (BbButton, BbCard, BbFormFieldInput, BbDataTable, etc.), no Bootstrap, no raw HTML where a component exists. Reference: https://blazorblueprintui.com/llms.txt
 4. **`.github/instructions/efcore.instructions.md`** (applyTo: `**/Data/**,**/Entities/**`)
 5. **`.github/instructions/playwright-tests.instructions.md`** (applyTo: `**/E2ETests/**`)
