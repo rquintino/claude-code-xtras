@@ -1,5 +1,9 @@
 # Claude Code Xtras
 
+[![Built for Claude Code](https://img.shields.io/badge/built%20for-Claude%20Code-D97757?logo=anthropic&logoColor=white)](https://claude.com/claude-code)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Last commit](https://img.shields.io/github/last-commit/rquintino/claude-code-xtras)](https://github.com/rquintino/claude-code-xtras/commits/main)
+
 A collection of AI agent skills, instruction, and Claude Code tooling I'm using or experimenting with (often both!). 
 
 **Important: these assets and tools are shared as they exist on my profile, may need adjustment and further testing to make them work properly for you.**
