@@ -173,6 +173,22 @@ function Fmt-Eta([string]$target) {
     }
 }
 
+# Linear projection of usage% at window end, from current% and elapsed fraction of the window.
+function Predict-EOW([double]$pct, [string]$reset_at, [double]$window_days) {
+    if ([string]::IsNullOrEmpty($reset_at) -or $reset_at -eq 'null') { return $null }
+    if ($reset_at -match '^\d+$') {
+        try { $t = [DateTimeOffset]::FromUnixTimeSeconds([long]$reset_at) } catch { return $null }
+    } else {
+        try { $t = [DateTimeOffset]::Parse($reset_at) } catch { return $null }
+    }
+    $remaining = [double]($t.ToUnixTimeSeconds() - [DateTimeOffset]::Now.ToUnixTimeSeconds())
+    if ($remaining -le 0) { return $null }
+    $window_sec = $window_days * 86400.0
+    $elapsed = $window_sec - $remaining
+    if ($elapsed -le ($window_sec * 0.05)) { return $null }
+    return $pct / ($elapsed / $window_sec)
+}
+
 # --- Rate limits ---
 $rate_parts = @()
 foreach ($pair in @(@('5h', $five_h, $five_h_reset), @('7d', $seven_d, $seven_d_reset))) {
@@ -183,11 +199,19 @@ foreach ($pair in @(@('5h', $five_h, $five_h_reset), @('7d', $seven_d, $seven_d_
         if ($has_val) { $v = [int][math]::Round([double]$val) } else { $v = 0 }
         $c = Color-Pct $v
         $bar = Make-PctBar $v 8
-        if ($eta) {
-            $rate_parts += "${dim}${label}:${reset}${c}${bar} ${v}%${reset}${dim}·${eta}${reset}"
-        } else {
-            $rate_parts += "${dim}${label}:${reset}${c}${bar} ${v}%${reset}"
+        $part = "${dim}${label}:${reset}${c}${bar} ${v}%${reset}"
+        if ($eta) { $part += "${dim}·${eta}${reset}" }
+        if ($label -eq '7d' -and $has_val) {
+            $pred = Predict-EOW ([double]$v) ([string]$reset_at) 7.0
+            if ($null -ne $pred) {
+                $pred_int = [int][math]::Round($pred)
+                if     ($pred_int -ge 115) { $pcol = "$e[31m" }
+                elseif ($pred_int -ge 85)  { $pcol = "$e[32m" }
+                else                        { $pcol = "$e[36m" }
+                $part += " ${dim}proj:${reset}${pcol}${pred_int}%${reset}"
+            }
         }
+        $rate_parts += $part
     }
 }
 $rate_part = if ($rate_parts.Count -gt 0) { $rate_parts -join ' ' } else { '' }
@@ -217,14 +241,7 @@ if ($lines_added -ne 0 -or $lines_removed -ne 0) {
 # --- Assemble line 1 ---
 $line1_parts = @($ctx_part)
 if ($display_name) {
-    # Match bash: highlight by family — Opus=magenta, Sonnet=cyan, Haiku=green, other=white.
-    switch -Regex ($model_id) {
-        'opus'   { $model_color = "$e[1;35m"; break }
-        'sonnet' { $model_color = "$e[1;36m"; break }
-        'haiku'  { $model_color = "$e[1;32m"; break }
-        default  { $model_color = "$e[1;37m" }
-    }
-    $model_label = "${model_color}${display_name}${reset}"
+    $model_label = "$e[1;96m${display_name}${reset}"
     if ($effort_part)   { $model_label = "$model_label $effort_part" }
     if ($thinking_part) { $model_label = "$model_label$thinking_part" }
     $line1_parts += $model_label
@@ -234,8 +251,10 @@ $line1 = $line1_parts -join $sep
 
 # --- Transcript aggregation (cumulative tokens + per-turn priced cost) ---
 function Price-Of([string]$m) {
+    # sonnet-5 promo (intro pricing through 2026-08-31): $2/$10 vs standard $3/$15 — revert after expiry
     if     ($m -match 'opus-4-[567]') { return @{i=5;  w5=6.25;  w1=10; r=0.50; o=25} }
     elseif ($m -match 'opus-4')       { return @{i=15; w5=18.75; w1=30; r=1.50; o=75} }
+    elseif ($m -match 'sonnet-5')     { return @{i=2;  w5=2.50;  w1=4;  r=0.20; o=10} }
     elseif ($m -match 'sonnet-4')     { return @{i=3;  w5=3.75;  w1=6;  r=0.30; o=15} }
     elseif ($m -match 'haiku-4')      { return @{i=1;  w5=1.25;  w1=2;  r=0.10; o=5} }
     else                              { return @{i=5;  w5=6.25;  w1=10; r=0.50; o=25} }
@@ -379,11 +398,12 @@ if ($sum_out -ne 0 -or $sum_in -ne 0 -or $sum_rd -ne 0 -or $sum_wr -ne 0) {
 # --- Last-call breakdown ---
 $last_part = ''
 if ($last_out -ne 0 -or $last_in -ne 0 -or $last_rd -ne 0 -or $last_wr -ne 0) {
-    # switch -Regex falls through all matching cases — break is required, otherwise
+    # switch -Regex falls through ALL matching cases — break is required, otherwise
     # 'opus-4-7' matches 'opus-4-[567]' AND 'opus-4' and the legacy price wins.
     switch -Regex ($model_id) {
         'opus-4-[567]' { $lp_in=5;  $lp_w=10; $lp_rd=0.50; $lp_out=25; break }
         'opus-4'       { $lp_in=15; $lp_w=30; $lp_rd=1.50; $lp_out=75; break }
+        'sonnet-5'     { $lp_in=2;  $lp_w=4;  $lp_rd=0.20; $lp_out=10; break }  # promo through 2026-08-31
         'sonnet-4'     { $lp_in=3;  $lp_w=6;  $lp_rd=0.30; $lp_out=15; break }
         'haiku-4'      { $lp_in=1;  $lp_w=2;  $lp_rd=0.10; $lp_out=5;  break }
         default        { $lp_in=5;  $lp_w=10; $lp_rd=0.50; $lp_out=25 }
@@ -397,19 +417,21 @@ if ($last_out -ne 0 -or $last_in -ne 0 -or $last_rd -ne 0 -or $last_wr -ne 0) {
     $last_part = "${dim}last ${reset} ${c_in}in:$(Fmt-Tok $last_in 6)${reset} ${c_cached}cached:$(Fmt-Tok $last_rd 6)${reset} ${c_wr}wr:$(Fmt-Tok $last_wr 6)${reset} ${c_out}out:$(Fmt-Tok $last_out 6)${reset} ${dim}≈${reset}${last_est} ${last_bar}"
 }
 
-# --- OS detection — match bash: bold green WSL2, bold yellow native Windows, dim others ---
-if ($env:WSL_DISTRO_NAME) {
-    $os_part = "$e[1;32m● WSL2$reset"
-} elseif ($IsLinux) {
-    $os_part = "${dim}● Linux${reset}"
-} elseif ($IsMacOS) {
-    $os_part = "${dim}● macOS${reset}"
-} else {
-    $os_part = "$e[1;33m● WIN (native)$reset"
+# --- OS detection ---
+$os_part = ''
+if ($env:WSL_DISTRO_NAME)              { $os_name = "WSL2 ($env:WSL_DISTRO_NAME)" }
+elseif ($IsLinux)                      { $os_name = 'Linux' }
+elseif ($IsMacOS)                      { $os_name = 'macOS' }
+else {
+    # Cheap, no WMI: OSVersion is in-process. Win11 keeps major 10.0, so map by build.
+    $osv = [System.Environment]::OSVersion.Version
+    $winname = if ($osv.Build -ge 22000) { '11' } else { '10' }
+    $os_name = "Windows $winname (build $($osv.Build))"
 }
+$os_part = "$e[32m●$reset ${dim}${os_name}${reset}"
 
-# --- Current time (cyan, matches bash) ---
-$now_part = "$e[36m🕐 $(Get-Date -Format 'HH:mm:ss')$reset"
+# --- Current time ---
+$now_part = "${dim}🕐 $(Get-Date -Format 'HH:mm:ss')${reset}"
 
 # --- Version stamp (script's own mtime) ---
 $version_part = ''

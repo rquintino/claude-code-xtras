@@ -159,6 +159,30 @@ make_pct_bar() {
       for (i = filled; i < w; i++) printf "░"
     }'
 }
+# Linear projection of usage% at window end, from current% and elapsed fraction of the
+# window. Args: pct, reset_at (epoch or ISO8601), window_days. Empty output if too early.
+predict_eow() {
+  local pct="$1" reset_at="$2" window_days="$3" now target
+  { [ -z "$reset_at" ] || [ "$reset_at" = "null" ]; } && return
+  if [[ "$reset_at" =~ ^[0-9]+$ ]]; then
+    target="$reset_at"
+  else
+    # GNU date (-d) on Linux/WSL2; fall back to BSD date (-j -f) on macOS.
+    target=$(date -d "$reset_at" +%s 2>/dev/null \
+      || date -j -f "%Y-%m-%dT%H:%M:%S" "${reset_at%%[.+Z]*}" +%s 2>/dev/null)
+  fi
+  [ -z "$target" ] && return
+  now=$(date +%s)
+  awk -v p="$pct" -v t="$target" -v now="$now" -v wd="$window_days" '
+    BEGIN {
+      remaining = t - now
+      if (remaining <= 0) exit 1
+      window_sec = wd * 86400.0
+      elapsed = window_sec - remaining
+      if (elapsed <= window_sec * 0.05) exit 1
+      printf "%.0f", p / (elapsed / window_sec)
+    }'
+}
 # Compact countdown from now to a target epoch: "3h12m", "45m", "2d3h"
 fmt_eta() {
   local target="$1" now diff d h m
@@ -184,22 +208,26 @@ if [ -n "$five_h" ] && [ "$five_h" != "null" ]; then
   c=$(color_for_pct "$v")
   bar=$(make_pct_bar "$v" 8)
   eta=$(fmt_eta "$five_h_reset")
-  if [ -n "$eta" ]; then
-    rate_parts+=("${dim}5h:${reset}${c}${bar} ${v}%${reset}${dim}·${eta}${reset}")
-  else
-    rate_parts+=("${dim}5h:${reset}${c}${bar} ${v}%${reset}")
-  fi
+  part="${dim}5h:${reset}${c}${bar} ${v}%${reset}"
+  [ -n "$eta" ] && part="${part}${dim}·${eta}${reset}"
+  rate_parts+=("$part")
 fi
 if [ -n "$seven_d" ] && [ "$seven_d" != "null" ]; then
   v=$(printf '%.0f' "$seven_d")
   c=$(color_for_pct "$v")
   bar=$(make_pct_bar "$v" 8)
   eta=$(fmt_eta "$seven_d_reset")
-  if [ -n "$eta" ]; then
-    rate_parts+=("${dim}7d:${reset}${c}${bar} ${v}%${reset}${dim}·${eta}${reset}")
-  else
-    rate_parts+=("${dim}7d:${reset}${c}${bar} ${v}%${reset}")
+  part="${dim}7d:${reset}${c}${bar} ${v}%${reset}"
+  [ -n "$eta" ] && part="${part}${dim}·${eta}${reset}"
+  # Linear end-of-window projection: red ≥115%, green ≥85% (on pace), cyan otherwise.
+  pred=$(predict_eow "$v" "$seven_d_reset" 7)
+  if [ -n "$pred" ]; then
+    if   [ "$pred" -ge 115 ]; then pcol="\033[31m"
+    elif [ "$pred" -ge 85 ];  then pcol="\033[32m"
+    else                           pcol="\033[36m"; fi
+    part="${part} ${dim}proj:${reset}${pcol}${pred}%${reset}"
   fi
+  rate_parts+=("$part")
 fi
 rate_part=""
 if [ "${#rate_parts[@]}" -gt 0 ]; then
@@ -232,14 +260,7 @@ fi
 line1_parts=()
 line1_parts+=("$ctx_part")
 if [ -n "$display_name" ]; then
-  # Highlight by family: Opus=magenta, Sonnet=cyan, Haiku=green, other=white.
-  case "$model_id" in
-    *opus*)   model_color="\033[1;35m" ;;
-    *sonnet*) model_color="\033[1;36m" ;;
-    *haiku*)  model_color="\033[1;32m" ;;
-    *)        model_color="\033[1;37m" ;;
-  esac
-  model_label="${model_color}${display_name}${reset}"
+  model_label="\033[1;96m${display_name}${reset}"
   [ -n "$effort_part" ]   && model_label="${model_label} ${effort_part}"
   [ -n "$thinking_part" ] && model_label="${model_label}${thinking_part}"
   line1_parts+=("$model_label")
@@ -280,9 +301,11 @@ if [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && [ -n "$session_id" 
     cost_out_raw=$(awk -F= '/^co=/{print $2}' "$tcache")
   else
     mapfile -t TS < <(jq -s '
+      # sonnet-5 promo (intro pricing through 2026-08-31): $2/$10 vs standard $3/$15 — revert after expiry
       def price(m):
         if   (m | test("opus-4-[567]"))  then {i:5,  w5:6.25, w1:10, r:0.50, o:25}
         elif (m | test("opus-4"))        then {i:15, w5:18.75,w1:30, r:1.50, o:75}
+        elif (m | test("sonnet-5"))      then {i:2,  w5:2.50, w1:4,  r:0.20, o:10}
         elif (m | test("sonnet-4"))      then {i:3,  w5:3.75, w1:6,  r:0.30, o:15}
         elif (m | test("haiku-4"))       then {i:1,  w5:1.25, w1:2,  r:0.10, o:5}
         else                                  {i:5,  w5:6.25, w1:10, r:0.50, o:25}
@@ -423,6 +446,7 @@ if [ "$last_out" != "0" ] || [ "$last_in" != "0" ] || [ "$last_rd" != "0" ] || [
   case "$model_id" in
     *opus-4-7*|*opus-4-6*|*opus-4-5*)        lp_in=5;  lp_w=10; lp_rd=0.50; lp_out=25 ;;
     *opus-4-1*|*opus-4-0*|*opus-4*)          lp_in=15; lp_w=30; lp_rd=1.50; lp_out=75 ;;
+    *sonnet-5*)                              lp_in=2;  lp_w=4;  lp_rd=0.20; lp_out=10 ;;  # promo through 2026-08-31
     *sonnet-4-6*|*sonnet-4-5*|*sonnet-4*)    lp_in=3;  lp_w=6;  lp_rd=0.30; lp_out=15 ;;
     *haiku-4-5*|*haiku-4*)                   lp_in=1;  lp_w=2;  lp_rd=0.10; lp_out=5  ;;
     *)                                       lp_in=5;  lp_w=10; lp_rd=0.50; lp_out=25 ;;
@@ -437,25 +461,37 @@ if [ "$last_out" != "0" ] || [ "$last_in" != "0" ] || [ "$last_rd" != "0" ] || [
   last_part="${dim}last ${reset} ${c_in}in:$(fmt_tok $last_in 6)${reset} ${c_cached}cached:$(fmt_tok $last_rd 6)${reset} ${c_wr}wr:$(fmt_tok $last_wr 6)${reset} ${c_out}out:$(fmt_tok $last_out 6)${reset} ${dim}≈${reset}${last_est} ${last_bar}"
 fi
 
-# --- Runtime env marker (WSL2 / native Windows / Linux / macOS) ---
+# --- Runtime env marker: green dot + dim OS name (WSL2 tagged with distro) ---
 # Distinguishes WSL2 (bash on Linux kernel with microsoft tag) from native Windows
 # bash (Git Bash / MSYS / Cygwin) so it's obvious which shell Claude Code is using.
-env_marker=""
-if [ -r /proc/version ] && grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
-  env_marker="\033[1;32m● WSL2\033[0m"        # bold green — the safe one on Windows hosts
-elif [ -n "$WSL_DISTRO_NAME" ] || [ -n "$WSL_INTEROP" ]; then
-  env_marker="\033[1;32m● WSL2\033[0m"
-elif [ -n "$WINDIR" ] || [ -n "$SYSTEMROOT" ] || [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* || "$OSTYPE" == win32* ]]; then
-  env_marker="\033[1;33m● WIN (native)\033[0m" # bold yellow — Windows-native bash, sandbox limited
+os_name=""
+if { [ -r /proc/version ] && grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; } \
+   || [ -n "$WSL_DISTRO_NAME" ] || [ -n "$WSL_INTEROP" ]; then
+  os_name="WSL2${WSL_DISTRO_NAME:+ ($WSL_DISTRO_NAME)}"
 elif [[ "$OSTYPE" == darwin* ]]; then
-  env_marker="${dim}● macOS${reset}"
-else
-  env_marker="${dim}● Linux${reset}"
+  os_name="macOS $(sw_vers -productVersion 2>/dev/null)"
+elif [ -n "$WINDIR" ] || [ -n "$SYSTEMROOT" ] || [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* || "$OSTYPE" == win32* ]]; then
+  # uname on Git Bash/MSYS/Cygwin embeds the build, e.g. MINGW64_NT-10.0-22631.
+  # Win11 keeps major 10.0, so map by build (>=22000 → 11), like the .ps1. Cheap, no cmd spawn.
+  # Match the "-<build>" suffix specifically: forms like MINGW32_NT-6.1 or MINGW64_NT-10.0
+  # (no dash-build) must yield empty, not a stray trailing digit (e.g. 6.1 → "1", 10.0 → "0").
+  win_build=$(uname -s 2>/dev/null | grep -oE '[-][0-9]+$' | tr -d '-')
+  if [ -n "$win_build" ] && [ "$win_build" -ge 22000 ] 2>/dev/null; then
+    os_name="Windows 11 (build $win_build) [native]"
+  elif [ -n "$win_build" ]; then
+    os_name="Windows 10 (build $win_build) [native]"
+  else
+    os_name="Windows (native)"
+  fi
+elif [ -r /etc/os-release ]; then
+  os_name=$( . /etc/os-release 2>/dev/null; echo "$PRETTY_NAME" )
 fi
+[ -z "$os_name" ] && os_name="Linux"
+env_marker="\033[32m●${reset} ${dim}${os_name}${reset}"
 version_part="$env_marker"
 
 # --- Clock (local wall time, refreshed each statusline render) ---
-clock_part="\033[36m🕐 $(date '+%H:%M:%S')\033[0m"
+clock_part="${dim}🕐 $(date '+%H:%M:%S')${reset}"
 version_part="${version_part}${sep}${clock_part}"
 
 # --- Version stamp: script's own mtime, so you can see when edits take effect ---
