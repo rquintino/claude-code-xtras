@@ -16,6 +16,7 @@ A collection of AI agent skills, instruction, and Claude Code tooling I'm using 
 | [plan-dotnet-app](skills/plan-dotnet-app/)   | Generate a build plan for .NET 10 Blazor Web Apps with Blazor Blueprint, EF Core, Playwright testing, and GitHub Actions CI. (from workshops)<br><br>If you want instead a ready to use starter repo see: https://github.com/rquintino/copilot-blazor-template |
 | [md2docx](skills/md2docx/)                   | The skill I use to convert markdown folders into word documents (ex. to share on my workshops, while we dont have markdown office standards 😉)                                                                                                                |
 | [pseudocode-rules](skills/pseudocode-rules/) | Write LLM instruction files (CLAUDE.md, agent policies, sandbox profiles) as compact pseudocode DSL — `deny()`/`allow()`/`require()` call sites with `# why` comments. Backed by recent research hinting  pseudocode > prose for instruction following.        |
+| [no-leak-mcq](skills/no-leak-mcq/)           | Generate or review four-option multiple-choice questions for answer leakage. Includes 18 checks covering position, length, language, specificity, punctuation, and answer-key patterns; manual content/style leak rules; and a stdlib-only validator. |
 
 
 ## Instructions
