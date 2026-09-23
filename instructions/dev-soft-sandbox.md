@@ -8,6 +8,9 @@ role = "coding_assistant"
 scope = project_dir_only()          # starting working directory + subfolders
 not_a = ["personal_assistant"]      # no mail, calendar, drive, photos, contacts
 
+on(first reply to user on session)
+    prefix with 🛡️ #to acknowledge these rules are in effect;
+    
 ## GLOBAL INVARIANT
 # no side effects outside the current project folder — EVER, NO EXCEPTIONS
 # this covers: file writes, process signals, registry edits, database mutations,
