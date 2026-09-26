@@ -12,6 +12,21 @@ input=$(cat)
 # Windows jq builds emit CRLF — strip CR so mapfile fields and $(( )) math work under Git Bash
 jq() { command jq "$@" | tr -d '\r'; }
 
+# fmt_num <x> <decimals> [group] — rounds half away from zero on 15 significant digits,
+# like .NET '{0:F2}' / '{0:N0}' in statusline.ps1 (awk printf alone rounds 0.475 -> 0.47).
+# group=1 adds thousands separators (N format).
+fmt_num() {
+  awk -v x="$1" -v d="$2" -v g="${3:-0}" 'BEGIN {
+    neg = (x < 0); if (neg) x = -x
+    m = 10 ^ d; v = int(sprintf("%.15g", x * m) + 0.5) / m
+    s = sprintf("%." d "f", v)
+    if (g) { i = index(s, "."); ip = i ? substr(s, 1, i - 1) : s; fp = i ? substr(s, i) : ""
+             o = ""; while (length(ip) > 3) { o = "," substr(ip, length(ip) - 2) o; ip = substr(ip, 1, length(ip) - 3) }
+             s = ip o fp }
+    if (neg && s + 0 != 0) s = "-" s
+    print s }'
+}
+
 # --- Pull all fields in one jq call ---
 # jq emits one field per line; mapfile preserves empty fields (unlike IFS-tab read,
 # which treats tab as whitespace and collapses empties).
@@ -89,10 +104,11 @@ branch=$(GIT_OPTIONAL_LOCKS=0 git -C "$cwd" symbolic-ref --short HEAD 2>/dev/nul
 
 # --- Working directory (collapsed to ~/.../<leaf>) ---
 short_cwd="${cwd/#$HOME/\~}"
+short_cwd="${short_cwd//\\//}"   # Windows cwd (Git Bash) arrives as D:\a\b — same as the .ps1
 leaf=$(basename "$short_cwd")
 if [[ "$short_cwd" == "~/"*"/"* ]]; then
   short_cwd="~/.../${leaf}"
-elif [[ "$short_cwd" == /*/*/* ]]; then
+elif [[ "$short_cwd" == /*/*/* || "$short_cwd" == [A-Za-z]:/*/*/* ]]; then
   short_cwd="/.../${leaf}"
 fi
 
@@ -129,7 +145,7 @@ thinking_part=""
 # --- Conversation cost (Claude Code's own counter; resets on /clear and resume) ---
 cost_part=""
 if [ -n "$cost" ] && [ "$cost" != "0" ] && [ "$cost" != "null" ]; then
-  conv_cost=$(awk "BEGIN { printf \"%.2f\", $cost }")
+  conv_cost=$(fmt_num "$cost" 2 1)
   cost_part="cost:\$${conv_cost}"
 fi
 
@@ -369,7 +385,7 @@ sum_wr=$(( sum_w5 + sum_w1 ))
 
 # Estimated $ at published API rates, summed per-turn with each turn's model price.
 # Format as right-padded to 7 chars: "$  0.01", "$ 15.19", etc.
-est_cost=$(awk "BEGIN { v = ($cost_in_raw + $cost_rd_raw + $cost_w5_raw + $cost_w1_raw + $cost_out_raw) / 1000000; printf \"\$%6.2f\", v }")
+est_cost=$(printf '$%6s' "$(fmt_num "$(awk "BEGIN { print ($cost_in_raw + $cost_rd_raw + $cost_w5_raw + $cost_w1_raw + $cost_out_raw) / 1000000 }")" 2)")
 
 # Compact human token formatter: 1234 → "1.2k", 1234567 → "1.2M"
 # Optional second arg: right-pad to width (e.g., fmt_tok 10 6 → "    10")
@@ -377,9 +393,9 @@ fmt_tok() {
   local n="${1:-0}" width="${2:-0}"
   local result
   if [ "$n" -ge 1000000 ]; then
-    result=$(awk "BEGIN { printf \"%.1fM\", $n / 1000000 }")
+    result="$(fmt_num "${n}e-6" 1)M"
   elif [ "$n" -ge 1000 ]; then
-    result=$(awk "BEGIN { printf \"%.1fk\", $n / 1000 }")
+    result="$(fmt_num "${n}e-3" 1)k"
   else
     result="$n"
   fi
@@ -486,7 +502,7 @@ if [ "$last_out" != "0" ] || [ "$last_in" != "0" ] || [ "$last_rd" != "0" ] || [
   l_cost_rd=$(awk  "BEGIN { printf \"%.6f\", $last_rd  * $lp_rd  / 1000000 }")
   l_cost_wr=$(awk  "BEGIN { printf \"%.6f\", $last_wr  * $lp_w   / 1000000 }")
   l_cost_out=$(awk "BEGIN { printf \"%.6f\", $last_out * $lp_out / 1000000 }")
-  last_est=$(awk   "BEGIN { v = $l_cost_in + $l_cost_rd + $l_cost_wr + $l_cost_out; printf \"\$%6.2f\", v }")
+  last_est=$(printf '$%6s' "$(fmt_num "$(awk "BEGIN { print $l_cost_in + $l_cost_rd + $l_cost_wr + $l_cost_out }")" 2)")
   last_bar=$(make_cost_bar 20 "$l_cost_in" "$l_cost_rd" "$l_cost_wr" "$l_cost_out")
   last_part="${dim}last ${reset} ${c_in}in:$(fmt_tok $last_in 6)${reset} ${c_cached}cached:$(fmt_tok $last_rd 6)${reset} ${c_wr}wr:$(fmt_tok $last_wr 6)${reset} ${c_out}out:$(fmt_tok $last_out 6)${reset} ${dim}≈${reset}${last_est} ${last_bar}"
 fi
@@ -507,10 +523,8 @@ CMP_BASE_DEF=20000      # B when the transcript can't tell us
 CMP_MIN_CTX=60000       # below this, compaction isn't worth discussing
 
 c_green="\033[32m"; c_yellow="\033[33m"; c_red="\033[31m"
-# 1234567 -> "1,235k" (matches PowerShell '{0:N0}k')
-fmt_k() { awk -v n="$1" 'BEGIN { v = sprintf("%.0f", n / 1000); s = ""
-  while (length(v) > 3) { s = "," substr(v, length(v) - 2) s; v = substr(v, 1, length(v) - 3) }
-  printf "%s%sk", v, s }'; }
+# 1234567 -> "1,235k" (PowerShell '{0:N0}k')
+fmt_k() { echo "$(fmt_num "${1}e-3" 0 1)k"; }
 
 cmp_part=""
 if [ -z "$has_cur_usage" ]; then
@@ -537,15 +551,15 @@ else
     [ -n "$pc_expires" ] && [ "${pc_expires%.*}" -le "$now" ] 2>/dev/null && cold=1
 
     delta=$(awk "BEGIN { print ($C - $S) * $p_r / 1000000 }")
-    delta_s=$(awk "BEGIN { printf \"%.3f\", $delta }")
+    delta_s=$(fmt_num "$delta" 3)
     shrink="${dim}$(fmt_k $C)->~$(fmt_k $S)${reset}"
 
     if [ "$cold" = 1 ]; then
       net=$(awk "BEGIN { print ($C * $w - ($C * $p_w5 + $CMP_SUMMARY_OUT * $p_o + $S * $w)) / 1000000 }")
       if awk "BEGIN { exit !($net > 0) }"; then
-        cmp_part="${cyan}cmp  ${reset} ${c_green}cold, compact now: ~\$$(awk "BEGIN { printf \"%.2f\", $net }") cheaper than resuming${reset} ${dim}then saves \$${delta_s}/req${reset} $shrink"
+        cmp_part="${cyan}cmp  ${reset} ${c_green}cold, compact now: ~\$$(fmt_num "$net" 2) cheaper than resuming${reset} ${dim}then saves \$${delta_s}/req${reset} $shrink"
       else
-        cmp_part="${cyan}cmp  ${reset} ${c_yellow}cold, compact costs ~\$$(awk "BEGIN { printf \"%.2f\", -($net) }") extra, then saves \$${delta_s}/req${reset} $shrink"
+        cmp_part="${cyan}cmp  ${reset} ${c_yellow}cold, compact costs ~\$$(fmt_num "$(awk "BEGIN { print -($net) }")" 2) extra, then saves \$${delta_s}/req${reset} $shrink"
       fi
     else
       U=$(awk "BEGIN { print ($C * $p_r + $CMP_SUMMARY_OUT * $p_o + ($S - $B) * $w) / 1000000 }")
@@ -556,9 +570,10 @@ else
       fi
       ttl_left=""
       if [ -n "$pc_expires" ]; then
+        # PowerShell's [int] cast rounds half to even — so does awk %.0f
         ttl_left=" ${dim}(cold in $(awk "BEGIN { printf \"%.0f\", (${pc_expires} - $now) / 60 }")m)${reset}"
       fi
-      cmp_part="${cyan}cmp  ${reset} ${dim}warm${reset}${ttl_left} ${dim}cost${reset} \$$(awk "BEGIN { printf \"%.2f\", $U }") ${dim}saves${reset} \$${delta_s}/req ${nc}pays back in $N req${reset} $shrink"
+      cmp_part="${cyan}cmp  ${reset} ${dim}warm${reset}${ttl_left} ${dim}cost${reset} \$$(fmt_num "$U" 2) ${dim}saves${reset} \$${delta_s}/req ${nc}pays back in $N req${reset} $shrink"
     fi
 
     [ "$C" -gt 200000 ] && cmp_part="${cmp_part} ${c_red}>200k: recall degrades${reset}"

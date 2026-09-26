@@ -128,16 +128,17 @@ if ($cost -gt 0) {
 }
 
 # --- Duration ---
+# [math]::Floor, not [int]: PowerShell's [int] cast rounds (90s -> "2m 30s"), bash truncates
 $duration_part = ''
 if ($duration_ms -gt 0) {
-    $dur_sec = [int]($duration_ms / 1000)
-    $mins = [int]($dur_sec / 60); $secs = $dur_sec % 60
+    $dur_sec = [long][math]::Floor($duration_ms / 1000)
+    $mins = [long][math]::Floor($dur_sec / 60); $secs = $dur_sec % 60
     $duration_part = "${dim}⏱ ${mins}m ${secs}s${reset}"
 }
 $api_part = ''
 if ($api_duration_ms -gt 0) {
-    $api_sec = [int]($api_duration_ms / 1000)
-    $api_mins = [int]($api_sec / 60); $api_secs = $api_sec % 60
+    $api_sec = [long][math]::Floor($api_duration_ms / 1000)
+    $api_mins = [long][math]::Floor($api_sec / 60); $api_secs = $api_sec % 60
     $api_part = "${dim}⚡ ${api_mins}m ${api_secs}s${reset}"
 }
 
@@ -163,13 +164,13 @@ function Fmt-Eta([string]$target) {
     $diff = [int]($t.ToUnixTimeSeconds() - [DateTimeOffset]::Now.ToUnixTimeSeconds())
     if ($diff -le 0) { return '' }
     if ($diff -ge 86400) {
-        $d = [int]($diff / 86400); $h = [int](($diff % 86400) / 3600)
+        $d = [math]::Floor($diff / 86400); $h = [math]::Floor(($diff % 86400) / 3600)
         return "${d}d${h}h"
     } elseif ($diff -ge 3600) {
-        $h = [int]($diff / 3600); $m = [int](($diff % 3600) / 60)
+        $h = [math]::Floor($diff / 3600); $m = [math]::Floor(($diff % 3600) / 60)
         return "${h}h${m}m"
     } else {
-        return "$([int]($diff / 60))m"
+        return "$([math]::Floor($diff / 60))m"
     }
 }
 
