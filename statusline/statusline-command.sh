@@ -4,9 +4,13 @@
 #   line 2: branch · PR · cwd · cost · lines · ⏱ duration · api
 #   line 3: Σ in/cached/wr/out [cost bar]
 #   line 4: last in/cached/wr/out [cost bar]
-#   line 5: version timestamp
+#   line 5: cmp  compaction advisor (cost / saving per request / payback, cold-cache signal)
+#   line 6: os · time · version timestamp
 
 input=$(cat)
+
+# Windows jq builds emit CRLF — strip CR so mapfile fields and $(( )) math work under Git Bash
+jq() { command jq "$@" | tr -d '\r'; }
 
 # --- Pull all fields in one jq call ---
 # jq emits one field per line; mapfile preserves empty fields (unlike IFS-tab read,
@@ -36,7 +40,11 @@ mapfile -t F < <(echo "$input" | jq -r '
   (.context_window.current_usage.output_tokens              // 0),
   (.effort.level         // ""),
   (.thinking.enabled     // false),
-  (.exceeds_200k_tokens  // false)
+  (.exceeds_200k_tokens  // false),
+  (if .context_window.current_usage == null then "" else "1" end),
+  (.prompt_cache.ttl        // ""),
+  (.prompt_cache.warm       | if . == null then "" else tostring end),
+  (.prompt_cache.expires_at // "")
 ')
 model_id="${F[0]}"
 display_name="${F[1]}"
@@ -63,6 +71,10 @@ last_out="${F[21]}"
 effort_level="${F[22]}"
 thinking_enabled="${F[23]}"
 exceeds_200k="${F[24]}"
+has_cur_usage="${F[25]}"
+pc_ttl="${F[26]}"
+pc_warm="${F[27]}"
+pc_expires="${F[28]}"
 
 # --- Colors ---
 reset="\033[0m"
@@ -276,7 +288,7 @@ done
 # Pricing applied per-turn using each message's .message.model field, since the
 # user may switch models mid-session. Breakdown: in=fresh input, cached=cache hits,
 # wr=cache writes, out=output. Source: docs.claude.com/en/about-claude/pricing
-# Cache format v2: includes per-category cost (in token·$/MTok units).
+# Cache format v3: includes per-category cost (in token·$/MTok units).
 sum_in=0; sum_rd=0; sum_w5=0; sum_w1=0; sum_out=0
 cost_in_raw=0; cost_rd_raw=0; cost_w5_raw=0; cost_w1_raw=0; cost_out_raw=0
 if [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && [ -n "$session_id" ]; then
@@ -288,7 +300,7 @@ if [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && [ -n "$session_id" 
   cached_version=""
   [ -f "$tcache" ] && cached_mtime=$(awk -F= '/^mtime=/{print $2}' "$tcache")
   [ -f "$tcache" ] && cached_version=$(awk -F= '/^v=/{print $2}' "$tcache")
-  if [ -n "$tmtime" ] && [ "$tmtime" = "$cached_mtime" ] && [ "$cached_version" = "2" ]; then
+  if [ -n "$tmtime" ] && [ "$tmtime" = "$cached_mtime" ] && [ "$cached_version" = "3" ]; then
     sum_in=$(awk -F= '/^in=/{print $2}'  "$tcache")
     sum_rd=$(awk -F= '/^rd=/{print $2}'  "$tcache")
     sum_w5=$(awk -F= '/^w5=/{print $2}'  "$tcache")
@@ -301,18 +313,25 @@ if [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && [ -n "$session_id" 
     cost_out_raw=$(awk -F= '/^co=/{print $2}' "$tcache")
   else
     mapfile -t TS < <(jq -s '
-      # sonnet-5 promo (intro pricing through 2026-08-31): $2/$10 vs standard $3/$15 — revert after expiry
-      def price(m):
-        if   (m | test("opus-4-[567]"))  then {i:5,  w5:6.25, w1:10, r:0.50, o:25}
-        elif (m | test("opus-4"))        then {i:15, w5:18.75,w1:30, r:1.50, o:75}
-        elif (m | test("sonnet-5"))      then {i:2,  w5:2.50, w1:4,  r:0.20, o:10}
-        elif (m | test("sonnet-4"))      then {i:3,  w5:3.75, w1:6,  r:0.30, o:15}
-        elif (m | test("haiku-4"))       then {i:1,  w5:1.25, w1:2,  r:0.10, o:5}
-        else                                  {i:5,  w5:6.25, w1:10, r:0.50, o:25}
-        end;
+      # $/MTok — source: platform.claude.com/docs/en/about-claude/pricing (checked 2026-09-26)
+      # Cache reads: 0.1x input, except Fable/Mythos 5.1 (0.025x) and Opus 5.5 (0.05x).
+      # Fast mode (Opus 5.5 / Opus 5 / Opus 4.8) = 2x on every category.
+      def price(m; speed):
+        (if   (m | test("opus-5-5"))            then {i:4,    w5:5,     w1:8,    r:0.20, o:20}
+         elif (m | test("(fable|mythos)-5-1"))  then {i:10,   w5:12.50, w1:20,   r:0.25, o:50}
+         elif (m | test("(fable|mythos)-5"))    then {i:10,   w5:12.50, w1:20,   r:1.00, o:50}
+         elif (m | test("opus-5|opus-4-[5-9]")) then {i:5,    w5:6.25,  w1:10,   r:0.50, o:25}
+         elif (m | test("opus-4"))              then {i:15,   w5:18.75, w1:30,   r:1.50, o:75}
+         elif (m | test("sonnet-5"))            then {i:2,    w5:2.50,  w1:4,    r:0.20, o:10}
+         elif (m | test("sonnet-4"))            then {i:3,    w5:3.75,  w1:6,    r:0.30, o:15}
+         elif (m | test("haiku-4"))             then {i:1,    w5:1.25,  w1:2,    r:0.10, o:5}
+         elif (m | test("haiku-3-5"))           then {i:0.80, w5:1,     w1:1.60, r:0.08, o:4}
+         else                                        {i:5,    w5:6.25,  w1:10,   r:0.50, o:25}
+         end) as $p
+        | if speed == "fast" and (m | test("opus-5|opus-4-8")) then $p | map_values(. * 2) else $p end;
       map(select(.type == "assistant"))
       | group_by(.requestId)
-      | map(.[0] | {u: (.message.usage // {}), p: price(.message.model // "")})
+      | map(.[0] | {u: (.message.usage // {}), p: price(.message.model // ""; .message.usage.speed // "")})
       | reduce .[] as $x ({in:0, cached:0, w5:0, w1:0, out:0, ci:0, cr:0, cw5:0, cw1:0, co:0};
           ($x.u.input_tokens                             // 0) as $ti |
           ($x.u.cache_read_input_tokens                  // 0) as $tr |
@@ -341,7 +360,7 @@ if [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && [ -n "$session_id" 
     cost_w5_raw="${TS[7]:-0}"
     cost_w1_raw="${TS[8]:-0}"
     cost_out_raw="${TS[9]:-0}"
-    printf 'v=2\nmtime=%s\nin=%s\nrd=%s\nw5=%s\nw1=%s\nout=%s\nci=%s\ncr=%s\ncw5=%s\ncw1=%s\nco=%s\n' \
+    printf 'v=3\nmtime=%s\nin=%s\nrd=%s\nw5=%s\nw1=%s\nout=%s\nci=%s\ncr=%s\ncw5=%s\ncw1=%s\nco=%s\n' \
       "$tmtime" "$sum_in" "$sum_rd" "$sum_w5" "$sum_w1" "$sum_out" \
       "$cost_in_raw" "$cost_rd_raw" "$cost_w5_raw" "$cost_w1_raw" "$cost_out_raw" > "$tcache"
   fi
@@ -377,6 +396,24 @@ c_cached="\033[32m"  # green   — cache hits (cheap)
 c_wr="\033[31m"    # red     — cache write (expensive)
 c_out="\033[35m"   # magenta — output
 cyan="\033[36m"
+
+# $/MTok for one model id — sets p_i p_w5 p_w1 p_r p_o. Same table as the jq price() above.
+# Order matters: more specific ids first ('opus-5-5' before 'opus-5', 'fable-5-1' before 'fable-5').
+price_of() {
+  case "$1" in
+    *opus-5-5*)                     set -- 4    5     8    0.20 20 ;;
+    *fable-5-1*|*mythos-5-1*)       set -- 10   12.50 20   0.25 50 ;;
+    *fable-5*|*mythos-5*)           set -- 10   12.50 20   1.00 50 ;;
+    *opus-5*|*opus-4-[5-9]*)        set -- 5    6.25  10   0.50 25 ;;
+    *opus-4*)                       set -- 15   18.75 30   1.50 75 ;;
+    *sonnet-5*)                     set -- 2    2.50  4    0.20 10 ;;
+    *sonnet-4*)                     set -- 3    3.75  6    0.30 15 ;;
+    *haiku-4*)                      set -- 1    1.25  2    0.10 5  ;;
+    *haiku-3-5*)                    set -- 0.80 1     1.60 0.08 4  ;;
+    *)                              set -- 5    6.25  10   0.50 25 ;;
+  esac
+  p_i=$1; p_w5=$2; p_w1=$3; p_r=$4; p_o=$5
+}
 
 # Stacked cost-share bar of width W. Segments ∝ each component's $ contribution.
 # Non-zero segments get ≥1 char. Colors: yellow=in, green=cached, red=wr, magenta=out.
@@ -442,15 +479,8 @@ if [ "$sum_out" != "0" ] || [ "$sum_in" != "0" ] || [ "$sum_rd" != "0" ] || [ "$
 fi
 last_part=""
 if [ "$last_out" != "0" ] || [ "$last_in" != "0" ] || [ "$last_rd" != "0" ] || [ "$last_wr" != "0" ]; then
-  # Current model's pricing for the most recent call (single turn → current model).
-  case "$model_id" in
-    *opus-4-7*|*opus-4-6*|*opus-4-5*)        lp_in=5;  lp_w=10; lp_rd=0.50; lp_out=25 ;;
-    *opus-4-1*|*opus-4-0*|*opus-4*)          lp_in=15; lp_w=30; lp_rd=1.50; lp_out=75 ;;
-    *sonnet-5*)                              lp_in=2;  lp_w=4;  lp_rd=0.20; lp_out=10 ;;  # promo through 2026-08-31
-    *sonnet-4-6*|*sonnet-4-5*|*sonnet-4*)    lp_in=3;  lp_w=6;  lp_rd=0.30; lp_out=15 ;;
-    *haiku-4-5*|*haiku-4*)                   lp_in=1;  lp_w=2;  lp_rd=0.10; lp_out=5  ;;
-    *)                                       lp_in=5;  lp_w=10; lp_rd=0.50; lp_out=25 ;;
-  esac
+  price_of "$model_id"
+  lp_in=$p_i; lp_w=$p_w1; lp_rd=$p_r; lp_out=$p_o
   # The input JSON doesn't split cache_creation by 5m vs 1h — use the 1h rate as upper bound.
   l_cost_in=$(awk  "BEGIN { printf \"%.6f\", $last_in  * $lp_in  / 1000000 }")
   l_cost_rd=$(awk  "BEGIN { printf \"%.6f\", $last_rd  * $lp_rd  / 1000000 }")
@@ -459,6 +489,85 @@ if [ "$last_out" != "0" ] || [ "$last_in" != "0" ] || [ "$last_rd" != "0" ] || [
   last_est=$(awk   "BEGIN { v = $l_cost_in + $l_cost_rd + $l_cost_wr + $l_cost_out; printf \"\$%6.2f\", v }")
   last_bar=$(make_cost_bar 20 "$l_cost_in" "$l_cost_rd" "$l_cost_wr" "$l_cost_out")
   last_part="${dim}last ${reset} ${c_in}in:$(fmt_tok $last_in 6)${reset} ${c_cached}cached:$(fmt_tok $last_rd 6)${reset} ${c_wr}wr:$(fmt_tok $last_wr 6)${reset} ${c_out}out:$(fmt_tok $last_out 6)${reset} ${dim}≈${reset}${last_est} ${last_bar}"
+fi
+
+# --- Compaction advisor: what /compact would cost and save, at API list prices ---
+# Counted per API REQUEST (an agentic prompt fans out into many, each re-reading the full context).
+#   C = current context, B = prefix that stays cached across compaction (system prompt + tools,
+#   ~= first request of the session), S = estimated post-compact context = B + summary + re-attached files/skills
+#   Warm: upfront U = C*r (summarize call reads cache) + O*o (summary + thinking) + (S-B)*w (re-cache)
+#         saving per later request D = (C-S)*r   ->  pays back after N = U/D requests
+#   Cold: the next request re-writes C at w anyway; compacting instead costs C*w5 + O*o + S*w
+#         net now = C*w - (C*w5 + O*o + S*w)  -> positive = compact before continuing
+# Sources: code.claude.com/docs/en/prompt-caching (#compacting-the-conversation, #cache-lifetime),
+#          code.claude.com/docs/en/context-window (what survives compaction).
+CMP_SUMMARY_OUT=8000    # assumption: summary + thinking output tokens of the compaction call
+CMP_REATTACH=20000      # assumption: re-read files (<=5 x <=5k) + skill bodies (<=25k) + summary text
+CMP_BASE_DEF=20000      # B when the transcript can't tell us
+CMP_MIN_CTX=60000       # below this, compaction isn't worth discussing
+
+c_green="\033[32m"; c_yellow="\033[33m"; c_red="\033[31m"
+# 1234567 -> "1,235k" (matches PowerShell '{0:N0}k')
+fmt_k() { awk -v n="$1" 'BEGIN { v = sprintf("%.0f", n / 1000); s = ""
+  while (length(v) > 3) { s = "," substr(v, length(v) - 2) s; v = substr(v, 1, length(v) - 3) }
+  printf "%s%sk", v, s }'; }
+
+cmp_part=""
+if [ -z "$has_cur_usage" ]; then
+  # null before the first request and right after /compact
+  cmp_part="${cyan}cmp  ${reset} ${dim}fresh context${reset}"
+else
+  C=$(( last_in + last_rd + last_wr ))
+  B=$CMP_BASE_DEF
+  if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
+    # first() stops reading at the first assistant request that carries usage
+    b_first=$(jq -rn 'first(inputs | select(.type == "assistant") | .message.usage | select(. != null)
+      | ((.input_tokens // 0) + (.cache_read_input_tokens // 0) + (.cache_creation_input_tokens // 0)))' \
+      "$transcript_path" 2>/dev/null)
+    [ -n "$b_first" ] && B=$b_first
+  fi
+  S=$(( B + CMP_REATTACH ))
+
+  if [ "$C" -ge "$CMP_MIN_CTX" ] && [ "$C" -gt "$S" ]; then
+    price_of "$model_id"
+    [ "$pc_ttl" = "5m" ] && w=$p_w5 || w=$p_w1
+    now=$(date +%s)
+    cold=0
+    [ "$pc_warm" = "false" ] && cold=1
+    [ -n "$pc_expires" ] && [ "${pc_expires%.*}" -le "$now" ] 2>/dev/null && cold=1
+
+    delta=$(awk "BEGIN { print ($C - $S) * $p_r / 1000000 }")
+    delta_s=$(awk "BEGIN { printf \"%.3f\", $delta }")
+    shrink="${dim}$(fmt_k $C)->~$(fmt_k $S)${reset}"
+
+    if [ "$cold" = 1 ]; then
+      net=$(awk "BEGIN { print ($C * $w - ($C * $p_w5 + $CMP_SUMMARY_OUT * $p_o + $S * $w)) / 1000000 }")
+      if awk "BEGIN { exit !($net > 0) }"; then
+        cmp_part="${cyan}cmp  ${reset} ${c_green}cold, compact now: ~\$$(awk "BEGIN { printf \"%.2f\", $net }") cheaper than resuming${reset} ${dim}then saves \$${delta_s}/req${reset} $shrink"
+      else
+        cmp_part="${cyan}cmp  ${reset} ${c_yellow}cold, compact costs ~\$$(awk "BEGIN { printf \"%.2f\", -($net) }") extra, then saves \$${delta_s}/req${reset} $shrink"
+      fi
+    else
+      U=$(awk "BEGIN { print ($C * $p_r + $CMP_SUMMARY_OUT * $p_o + ($S - $B) * $w) / 1000000 }")
+      N=$(awk "BEGIN { q = $U / $delta; n = int(q); if (n < q) n++; print n }")
+      if   [ "$N" -le 10 ]; then nc=$c_green
+      elif [ "$N" -le 30 ]; then nc=$c_yellow
+      else                       nc=$dim
+      fi
+      ttl_left=""
+      if [ -n "$pc_expires" ]; then
+        ttl_left=" ${dim}(cold in $(awk "BEGIN { printf \"%.0f\", (${pc_expires} - $now) / 60 }")m)${reset}"
+      fi
+      cmp_part="${cyan}cmp  ${reset} ${dim}warm${reset}${ttl_left} ${dim}cost${reset} \$$(awk "BEGIN { printf \"%.2f\", $U }") ${dim}saves${reset} \$${delta_s}/req ${nc}pays back in $N req${reset} $shrink"
+    fi
+
+    [ "$C" -gt 200000 ] && cmp_part="${cmp_part} ${c_red}>200k: recall degrades${reset}"
+    if [ "$ctx_size" -gt 0 ] 2>/dev/null && awk "BEGIN { exit !($C / $ctx_size >= 0.85) }"; then
+      cmp_part="${cmp_part} ${c_yellow}auto-compact near${reset}"
+    fi
+  else
+    cmp_part="${cyan}cmp  ${reset} ${dim}context small, no benefit${reset}"
+  fi
 fi
 
 # --- Runtime env marker: green dot + dim OS name (WSL2 tagged with distro) ---
@@ -526,4 +635,5 @@ echo -e "$line1"
 [ -n "$line2" ]        && echo -e "$line2"
 [ -n "$tokens_part" ]  && echo -e "$tokens_part"
 [ -n "$last_part" ]    && echo -e "$last_part"
+[ -n "$cmp_part" ]     && echo -e "$cmp_part"
 [ -n "$version_part" ] && echo -e "$version_part"

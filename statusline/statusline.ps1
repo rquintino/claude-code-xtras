@@ -251,8 +251,11 @@ $line1 = $line1_parts -join $sep
 
 # --- Transcript aggregation (cumulative tokens + per-turn priced cost) ---
 function Price-Of([string]$m) {
-    # sonnet-5 promo (intro pricing through 2026-08-31): $2/$10 vs standard $3/$15 — revert after expiry
-    if     ($m -match 'opus-4-[567]') { return @{i=5;  w5=6.25;  w1=10; r=0.50; o=25} }
+    # Cache reads: 0.025x on fable/mythos-5-1, 0.05x on opus-5-5, 0.1x elsewhere
+    if     ($m -match '(fable|mythos)-5-1') { return @{i=10; w5=12.50; w1=20; r=0.25; o=50} }
+    elseif ($m -match '(fable|mythos)-5')   { return @{i=10; w5=12.50; w1=20; r=1.00; o=50} }
+    elseif ($m -match 'opus-5-5')     { return @{i=4;  w5=5.00;  w1=8;  r=0.20; o=20} }
+    elseif ($m -match 'opus-5|opus-4-[5678]') { return @{i=5;  w5=6.25;  w1=10; r=0.50; o=25} }
     elseif ($m -match 'opus-4')       { return @{i=15; w5=18.75; w1=30; r=1.50; o=75} }
     elseif ($m -match 'sonnet-5')     { return @{i=2;  w5=2.50;  w1=4;  r=0.20; o=10} }
     elseif ($m -match 'sonnet-4')     { return @{i=3;  w5=3.75;  w1=6;  r=0.30; o=15} }
@@ -401,9 +404,12 @@ if ($last_out -ne 0 -or $last_in -ne 0 -or $last_rd -ne 0 -or $last_wr -ne 0) {
     # switch -Regex falls through ALL matching cases — break is required, otherwise
     # 'opus-4-7' matches 'opus-4-[567]' AND 'opus-4' and the legacy price wins.
     switch -Regex ($model_id) {
-        'opus-4-[567]' { $lp_in=5;  $lp_w=10; $lp_rd=0.50; $lp_out=25; break }
+        '(fable|mythos)-5-1'    { $lp_in=10; $lp_w=20; $lp_rd=0.25; $lp_out=50; break }
+        '(fable|mythos)-5'      { $lp_in=10; $lp_w=20; $lp_rd=1.00; $lp_out=50; break }
+        'opus-5-5'              { $lp_in=4;  $lp_w=8;  $lp_rd=0.20; $lp_out=20; break }
+        'opus-5|opus-4-[5678]'  { $lp_in=5;  $lp_w=10; $lp_rd=0.50; $lp_out=25; break }
         'opus-4'       { $lp_in=15; $lp_w=30; $lp_rd=1.50; $lp_out=75; break }
-        'sonnet-5'     { $lp_in=2;  $lp_w=4;  $lp_rd=0.20; $lp_out=10; break }  # promo through 2026-08-31
+        'sonnet-5'     { $lp_in=2;  $lp_w=4;  $lp_rd=0.20; $lp_out=10; break }
         'sonnet-4'     { $lp_in=3;  $lp_w=6;  $lp_rd=0.30; $lp_out=15; break }
         'haiku-4'      { $lp_in=1;  $lp_w=2;  $lp_rd=0.10; $lp_out=5;  break }
         default        { $lp_in=5;  $lp_w=10; $lp_rd=0.50; $lp_out=25 }
