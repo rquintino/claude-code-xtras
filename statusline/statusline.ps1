@@ -3,7 +3,8 @@
 #   line 2: branch · PR · cwd · cost · lines · ⏱ duration · api
 #   line 3: Σ in/cached/wr/out [cost bar]
 #   line 4: last in/cached/wr/out [cost bar]
-#   line 5: version timestamp
+#   line 5: cmp  compaction advisor (cost / saving per request / payback, cold-cache signal)
+#   line 6: os · time · version timestamp
 
 $ErrorActionPreference = 'Continue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -50,6 +51,10 @@ $last_out         = [long](Get-Prop $j 'context_window.current_usage.output_toke
 $effort_level     = [string](Get-Prop $j 'effort.level' '')
 $thinking_enabled = [bool](Get-Prop $j 'thinking.enabled' $false)
 $exceeds_200k     = [bool](Get-Prop $j 'exceeds_200k_tokens' $false)
+$has_cur_usage    = ($null -ne (Get-Prop $j 'context_window.current_usage' $null))
+$pc_ttl           = [string](Get-Prop $j 'prompt_cache.ttl' '')
+$pc_warm          = Get-Prop $j 'prompt_cache.warm' $null
+$pc_expires       = Get-Prop $j 'prompt_cache.expires_at' $null
 
 # --- Colors (ANSI via ESC = [char]27, PS 5.1 safe) ---
 $e       = [char]27
@@ -424,6 +429,94 @@ if ($last_out -ne 0 -or $last_in -ne 0 -or $last_rd -ne 0 -or $last_wr -ne 0) {
     $last_part = "${dim}last ${reset} ${c_in}in:$(Fmt-Tok $last_in 6)${reset} ${c_cached}cached:$(Fmt-Tok $last_rd 6)${reset} ${c_wr}wr:$(Fmt-Tok $last_wr 6)${reset} ${c_out}out:$(Fmt-Tok $last_out 6)${reset} ${dim}≈${reset}${last_est} ${last_bar}"
 }
 
+# --- Compaction advisor: what /compact would cost and save, at API list prices ---
+# Counted per API REQUEST (an agentic prompt fans out into many, each re-reading the full context).
+#   C = current context, B = prefix that stays cached across compaction (system prompt + tools,
+#   ~= first request of the session), S = estimated post-compact context = B + summary + re-attached files/skills
+#   Warm: upfront U = C*r (summarize call reads cache) + O*o (summary + thinking) + (S-B)*w (re-cache)
+#         saving per later request D = (C-S)*r   ->  pays back after N = U/D requests
+#   Cold: the next request re-writes C at w anyway; compacting instead costs C*w5 + O*o + S*w
+#         net now = C*w - (C*w5 + O*o + S*w)  -> positive = compact before continuing
+# Sources: code.claude.com/docs/en/prompt-caching (#compacting-the-conversation, #cache-lifetime),
+#          code.claude.com/docs/en/context-window (what survives compaction).
+$CMP_SUMMARY_OUT = 8000    # assumption: summary + thinking output tokens of the compaction call
+$CMP_REATTACH    = 20000   # assumption: re-read files (<=5 x <=5k) + skill bodies (<=25k) + summary text
+$CMP_BASE_DEF    = 20000   # B when the transcript can't tell us
+$CMP_MIN_CTX     = 60000   # below this, compaction isn't worth discussing
+
+$c_green = "$e[32m"; $c_yellow = "$e[33m"; $c_red = "$e[31m"
+
+# 1234567 -> "1,235k" (matches .NET '{0:N0}k')
+function Fmt-K([double]$n) {
+    return ('{0:N0}k' -f [math]::Round($n / 1000.0))
+}
+
+$cmp_part = ''
+if (-not $has_cur_usage) {
+    # null before the first request and right after /compact
+    $cmp_part = "${cyan}cmp  ${reset} ${dim}fresh context${reset}"
+} else {
+    $C = $last_in + $last_rd + $last_wr
+    $B = $CMP_BASE_DEF
+    if ($transcript_path -and (Test-Path -LiteralPath $transcript_path)) {
+        foreach ($ln in [System.IO.File]::ReadLines($transcript_path)) {
+            if ([string]::IsNullOrWhiteSpace($ln)) { continue }
+            try { $obj = $ln | ConvertFrom-Json } catch { continue }
+            if ($obj.type -ne 'assistant') { continue }
+            $u = $obj.message.usage
+            if ($null -eq $u) { continue }
+            $ti = [long](Get-Prop $u 'input_tokens' 0)
+            $tr = [long](Get-Prop $u 'cache_read_input_tokens' 0)
+            $tc = [long](Get-Prop $u 'cache_creation_input_tokens' 0)
+            $B = $ti + $tr + $tc
+            break
+        }
+    }
+    $S = $B + $CMP_REATTACH
+
+    if ($C -ge $CMP_MIN_CTX -and $C -gt $S) {
+        $p = Price-Of $model_id
+        $w = if ($pc_ttl -eq '5m') { $p.w5 } else { $p.w1 }
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $cold = $false
+        if ($pc_warm -eq $false) { $cold = $true }
+        if ($null -ne $pc_expires -and [long]$pc_expires -le $now) { $cold = $true }
+
+        $delta = ($C - $S) * $p.r / 1000000.0
+        $delta_s = '{0:F3}' -f $delta
+        $shrink = "${dim}$(Fmt-K $C)->~$(Fmt-K $S)${reset}"
+
+        if ($cold) {
+            $net = ($C * $w - ($C * $p.w5 + $CMP_SUMMARY_OUT * $p.o + $S * $w)) / 1000000.0
+            if ($net -gt 0) {
+                $cmp_part = "${cyan}cmp  ${reset} ${c_green}cold, compact now: ~`$$('{0:F2}' -f $net) cheaper than resuming${reset} ${dim}then saves `$${delta_s}/req${reset} $shrink"
+            } else {
+                $cmp_part = "${cyan}cmp  ${reset} ${c_yellow}cold, compact costs ~`$$('{0:F2}' -f (-$net)) extra, then saves `$${delta_s}/req${reset} $shrink"
+            }
+        } else {
+            $U = ($C * $p.r + $CMP_SUMMARY_OUT * $p.o + ($S - $B) * $w) / 1000000.0
+            $N = [long][math]::Ceiling($U / $delta)
+            if     ($N -le 10) { $nc = $c_green }
+            elseif ($N -le 30) { $nc = $c_yellow }
+            else                { $nc = $dim }
+            $ttl_left = ''
+            if ($null -ne $pc_expires) {
+                # PowerShell's [long] cast truncates like C's (int); bash uses awk %.0f (round half to even)
+                $mins = [math]::Round(([long]$pc_expires - $now) / 60.0)
+                $ttl_left = " ${dim}(cold in ${mins}m)${reset}"
+            }
+            $cmp_part = "${cyan}cmp  ${reset} ${dim}warm${reset}${ttl_left} ${dim}cost${reset} `$$('{0:F2}' -f $U) ${dim}saves${reset} `$${delta_s}/req ${nc}pays back in $N req${reset} $shrink"
+        }
+
+        if ($C -gt 200000) { $cmp_part = "$cmp_part ${c_red}>200k: recall degrades${reset}" }
+        if ($ctx_size -gt 0 -and ($C / [double]$ctx_size) -ge 0.85) {
+            $cmp_part = "$cmp_part ${c_yellow}auto-compact near${reset}"
+        }
+    } else {
+        $cmp_part = "${cyan}cmp  ${reset} ${dim}context small, no benefit${reset}"
+    }
+}
+
 # --- OS detection ---
 $os_part = ''
 if ($env:WSL_DISTRO_NAME)              { $os_name = "WSL2 ($env:WSL_DISTRO_NAME)" }
@@ -468,4 +561,5 @@ Write-Host $line1
 if ($line2)        { Write-Host $line2 }
 if ($tokens_part)  { Write-Host $tokens_part }
 if ($last_part)    { Write-Host $last_part }
+if ($cmp_part)     { Write-Host $cmp_part }
 if ($version_part) { Write-Host $version_part }
