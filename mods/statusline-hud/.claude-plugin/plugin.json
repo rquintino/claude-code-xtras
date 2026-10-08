@@ -1,0 +1,76 @@
+{
+  "name": "statusline-hud",
+  "displayName": "Statusline HUD",
+  "version": "0.2.0",
+  "description": "Live session HUD: context, rate-limit pace, per-request and per-turn cost, cache countdown and miss detection, compaction advisor, dashboard pane and a budget tool for the model; leaves out what Desktop already shows",
+  "author": {
+    "name": "Rui Quintino",
+    "url": "https://github.com/rquintino"
+  },
+  "homepage": "https://github.com/rquintino/claude-code-xtras/tree/main/mods/statusline-hud",
+  "repository": "https://github.com/rquintino/claude-code-xtras",
+  "license": "MIT",
+  "keywords": [
+    "statusline",
+    "hud",
+    "cost",
+    "context",
+    "rate-limits",
+    "prompt-cache",
+    "mod"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "display": {
+      "type": "string",
+      "title": "Where to show the HUD",
+      "description": "band: multi-row band above the prompt; status: one pinned line; both",
+      "options": [
+        "band",
+        "status",
+        "both"
+      ],
+      "default": "band"
+    },
+    "density": {
+      "type": "string",
+      "title": "Band density",
+      "description": "full: six rows (tokens, last request, compaction advisor, env); compact: two rows",
+      "options": [
+        "full",
+        "compact"
+      ],
+      "default": "full"
+    },
+    "cacheTtl": {
+      "type": "string",
+      "title": "Prompt cache TTL",
+      "description": "auto follows Claude Code's rules (env vars, then 1h on a subscription within plan usage, else 5m); set it if you use the promptCacheTtl setting",
+      "options": [
+        "auto",
+        "5m",
+        "1h"
+      ],
+      "default": "auto"
+    },
+    "budgetUsd": {
+      "type": "number",
+      "title": "Session budget (USD)",
+      "description": "Toast once and turn the cost red when the session passes it; 0 turns it off",
+      "default": 0,
+      "min": 0
+    },
+    "alerts": {
+      "type": "boolean",
+      "title": "Toast alerts",
+      "description": "Context 80/90%, rate-limit pace, cache about to go cold, budget",
+      "default": true
+    },
+    "turnCost": {
+      "type": "boolean",
+      "title": "Turn cost",
+      "description": "Show what the running turn has cost beside the spinner, and each finished turn's cost on its closing line",
+      "default": true
+    }
+  }
+}
