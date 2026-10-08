@@ -1,0 +1,23 @@
+{
+  "name": "flashcards",
+  "displayName": "Flash cards",
+  "version": "0.1.0",
+  "description": "Software development flash cards on a side board: three cards that flip on a press, written by the model only while the board is open, with Got it / Again spaced repetition",
+  "author": {
+    "name": "Rui Quintino",
+    "url": "https://github.com/rquintino"
+  },
+  "homepage": "https://github.com/rquintino/claude-code-xtras/tree/main/mods/flashcards",
+  "repository": "https://github.com/rquintino/claude-code-xtras",
+  "license": "MIT",
+  "keywords": ["flashcards", "learning", "spaced-repetition", "mod"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "model": {
+      "type": "string",
+      "title": "Card model",
+      "description": "The model that writes the cards, three per call",
+      "default": "claude-haiku-5-5"
+    }
+  }
+}

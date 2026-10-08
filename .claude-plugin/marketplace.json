@@ -11,6 +11,13 @@
       "keywords": ["statusline", "hud", "cost", "mod"]
     },
     {
+      "name": "flashcards",
+      "source": "./mods/flashcards",
+      "description": "Mod: software development flash cards on a side board; flip on a press, Got it / Again spaced repetition, your own topic; the model is asked only while the board is open",
+      "category": "learning",
+      "keywords": ["flashcards", "learning", "mod"]
+    },
+    {
       "name": "xtras-skills",
       "source": "./",
       "description": "Skills: lisa-loop, plan-dotnet-app, md2docx, pseudocode-rules, no-leak-mcq",
