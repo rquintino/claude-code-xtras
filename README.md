@@ -30,7 +30,7 @@ Or from a shell: `claude plugin marketplace add rquintino/claude-code-xtras`, th
 
 | Mod | Description |
 | --- | ----------- |
-| [statusline-hud](mods/statusline-hud/) | Port of the [status line](statusline/) on steroids: band above the prompt, `/hud` dashboard pane, toasts when context, rate-limit pace, budget or prompt-cache expiry need attention, `[ Compact now ]` when the advisor says it pays off, and `mcp__statusline-hud__usage` so Claude can check its own budget. |
+| [statusline-hud](mods/statusline-hud/) | Port of the [status line](statusline/) on steroids: band above the prompt, per-turn cost on the spinner and turn line, `/hud` dashboard pane, toasts when context, rate-limit pace, budget, cache expiry or an unexpected cache miss need attention, a compaction log, `[ Compact now ]` when the advisor says it pays off, and `mcp__statusline-hud__usage` so Claude can check its own budget. On Claude Code Desktop it leaves out what the Code tab already shows. |
 
 ## Skills
 

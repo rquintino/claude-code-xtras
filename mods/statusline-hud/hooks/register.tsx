@@ -1,47 +1,54 @@
 // statusline-hud: a Claude Code mod port of statusline/statusline-command.sh, plus what a
 // script status line can't do: live per-request accounting, subagent spend, rate-limit
-// burn ETAs, cache-cold countdown, a one-key /compact, toasts, a dashboard pane and a
-// tool the model can call to check its own budget.
+// burn ETAs, cache-cold countdown and miss detection, per-turn cost, a one-key /compact,
+// toasts, a dashboard pane and a tool the model can call to check its own budget.
+// Surface-aware: on Claude Code Desktop it leaves out what the Code tab already shows.
 
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 
-import type { HudLedger, HudRate, HudView } from '../types'
+import type { HudCompaction, HudLedger, HudRate, HudView } from '../types'
+import { bar, cacheState, fmtDur, fmtTok, fmtUsd, outlook, parseGit, spark, spendOf, TTL_MS, WINDOW_MS, type Ttl } from './calc'
 import {
-  advise,
-  bar,
-  cacheState,
-  costSegments,
-  fmtDur,
-  fmtTok,
-  fmtUsd,
-  modelLabel,
-  outlook,
-  parseGit,
-  spark,
-  spendOf,
-  WINDOW_MS,
-  type Advice,
-  type Spend,
-  type Ttl,
-} from './calc'
+  adviceFor,
+  adviceText,
+  allUsd,
+  bandRows,
+  compactLine,
+  costBar,
+  hitRatio,
+  missCause,
+  pctColor,
+  projColor,
+  report,
+  shouldCompact,
+  shows,
+  totals,
+  turnSoFar,
+  turnTail,
+  type Seg,
+  type Surface,
+} from './present'
 
 const PANE = 'hud'
 const TICK_MS = 15_000
 const HISTORY = 60
 const KEEP_SESSIONS = 40
+const KEEP_DAYS = 35
 
 const EMPTY: HudLedger = {
   reqs: 0, in: 0, rd: 0, wr: 0, out: 0, usdIn: 0, usdRd: 0, usdWr: 0, usdOut: 0,
-  agentReqs: 0, agentUsd: 0, ctxHistory: [], usdHistory: [], tools: {}, turnMs: [],
+  agentReqs: 0, agentUsd: 0, ctxHistory: [], usdHistory: [], tools: {}, turns: [],
+  misses: 0, missUsd: 0, compactions: [], savedUsd: 0,
 }
 
 const view = atom({ plugin: 'statusline-hud', key: 'view' } as const, null)
 const ledger = atom({ plugin: 'statusline-hud', key: 'ledger' } as const, EMPTY)
 const isHidden = atom({ plugin: 'statusline-hud', key: 'isHidden' } as const, false)
 const fired = atom({ plugin: 'statusline-hud', key: 'fired' } as const, [])
+const turn = atom({ plugin: 'statusline-hud', key: 'turn' } as const, null)
 
-type Opts = { display: string; density: string; cacheTtl: string; budgetUsd: number; alerts: boolean }
+type Opts = { display: string; density: string; cacheTtl: string; budgetUsd: number; alerts: boolean; turnCost: boolean }
 
 function readOptions(o: PluginOptions): Opts {
   return {
@@ -50,28 +57,21 @@ function readOptions(o: PluginOptions): Opts {
     cacheTtl: typeof o.cacheTtl === 'string' ? o.cacheTtl : 'auto',
     budgetUsd: typeof o.budgetUsd === 'number' ? o.budgetUsd : 0,
     alerts: typeof o.alerts === 'boolean' ? o.alerts : true,
+    turnCost: typeof o.turnCost === 'boolean' ? o.turnCost : true,
   }
 }
 
-const push = (list: readonly number[], v: number) => [...list, v].slice(-HISTORY)
+const push = <T,>(list: readonly T[], v: T) => [...list, v].slice(-HISTORY)
 
-/** Spend of the ledger's totals, per category. */
-function totals(l: HudLedger): Spend {
-  return { in: l.usdIn, rd: l.usdRd, wr: l.usdWr, out: l.usdOut, total: l.usdIn + l.usdRd + l.usdWr + l.usdOut }
+/** Local calendar day, the key of the cross-session spend totals. */
+function dayKey(ms: number): string {
+  const d = new Date(ms)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
-/** Share of input tokens the cache served. */
-function hitRatio(l: HudLedger): number | undefined {
-  const all = l.in + l.rd + l.wr
-  return all > 0 ? l.rd / all : undefined
-}
-
-function pctColor(p: number): string {
-  return p >= 80 ? 'error' : p >= 50 ? 'warning' : 'success'
-}
-
-function projColor(p: number): string {
-  return p >= 115 ? 'error' : p >= 85 ? 'success' : 'cyan'
+function clockOf(ms: number): string {
+  const d = new Date(ms)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
 /** Which TTL the main conversation's cache writes get, by the precedence Claude Code documents. */
@@ -86,7 +86,7 @@ async function resolveTtl($: EngineInterface, opts: Opts, auth: HudView['auth'],
   return '1h'
 }
 
-/** Subagents, workflows and forks: five minutes unless pinned. */
+/** Subagents, workflows, forks and compaction: five minutes unless pinned. */
 async function resolveAgentTtl($: EngineInterface): Promise<Ttl> {
   if ((await $.env.get('FORCE_PROMPT_CACHING_5M')) === '1') return '5m'
   const pinned = await $.env.get('CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL')
@@ -116,69 +116,36 @@ async function readGit($: EngineInterface): Promise<HudView['git']> {
   return parseGit(status.stdout, stat?.exitCode === 0 ? stat.stdout : '')
 }
 
-/** One-shot plain-text report: /hud status, the Copy button and the model's tool share it. */
-function report(v: HudView, l: HudLedger, now: number): string {
-  const lines: string[] = []
-  const cache = cacheState(l.last?.at, v.ttl, now)
-  lines.push(
-    `model ${modelLabel(v.model)}${v.effort ? ` [${v.effort}]` : ''}; context ${v.ctxPct ?? '?'}% ` +
-      `(${fmtTok(v.ctxTokens ?? 0)} of ${fmtTok(v.ctxWindow)})`,
-  )
-  for (const r of v.rates) {
-    const o = outlook(r.pct, r.resetsAt, WINDOW_MS[r.kind], now)
-    lines.push(
-      `${r.kind}: ${r.pct}% used` +
-        (o.resetsInMs !== undefined ? `, resets in ${fmtDur(o.resetsInMs)}` : '') +
-        (o.projected !== undefined ? `, on pace for ${o.projected}% at reset` : '') +
-        (o.hitsLimitInMs !== undefined ? `, hits 100% in ~${fmtDur(o.hitsLimitInMs)}` : ''),
-    )
-  }
-  const t = totals(l)
-  const hit = hitRatio(l)
-  lines.push(
-    `session cost ${v.costUsd !== undefined ? fmtUsd(v.costUsd) : '?'} (engine); ${fmtUsd(t.total)} at list price over ${l.reqs} requests` +
-      (hit !== undefined ? `, cache hit ${Math.round(hit * 100)}%` : '') +
-      (l.agentReqs > 0 ? `; subagents ${fmtUsd(l.agentUsd)} over ${l.agentReqs} requests` : ''),
-  )
-  lines.push(`prompt cache (${v.ttl}): ${cache.warm ? `warm, cold in ${fmtDur(cache.leftMs)}` : 'cold'}`)
-  lines.push(`compaction: ${adviceText(adviceFor(v, l, now))}`)
-  return lines.join('\n')
+/** Subagents still at work, as the engine tracks them. */
+async function agentsRunning($: EngineInterface): Promise<number> {
+  const agents = await $.agent.list().catch(() => [])
+  return agents.filter(a => a.status === 'pending' || a.status === 'running' || a.status === 'waiting').length
 }
 
-function adviceFor(v: HudView, l: HudLedger, now: number): Advice {
-  return advise({
-    ctx: v.ctxTokens,
-    base: l.baseCtx,
-    window: v.ctxWindow,
-    model: v.model,
-    ttl: v.ttl,
-    warm: cacheState(l.last?.at, v.ttl, now).warm,
-  })
+/** List-price spend today and over the last 7 days, across this machine's sessions. */
+async function readSpend($: EngineInterface, now: number): Promise<HudView['spend']> {
+  const days = ((await $.store.get('days')) as Record<string, number> | undefined) ?? {}
+  let week = 0
+  for (let i = 0; i < 7; i++) week += days[dayKey(now - i * 86_400_000)] ?? 0
+  const today = days[dayKey(now)] ?? 0
+  return week > 0 ? { today, week } : undefined
 }
 
-function adviceText(a: Advice): string {
-  switch (a.kind) {
-    case 'fresh':
-      return 'fresh context'
-    case 'small':
-      return 'context small, no benefit'
-    case 'cold':
-      return a.netNowUsd > 0
-        ? `cache cold: compacting now is ~${fmtUsd(a.netNowUsd)} cheaper than resuming, then saves ${fmtUsd(a.savesPerReq)}/request`
-        : `cache cold: compacting costs ~${fmtUsd(-a.netNowUsd)} extra, then saves ${fmtUsd(a.savesPerReq)}/request`
-    case 'warm':
-      return `costs ${fmtUsd(a.costUsd)}, saves ${fmtUsd(a.savesPerReq)}/request, pays back in ${a.paybackReqs} requests`
-  }
-}
-
-/** Compacting is clearly worth it: cold and cheaper now, or warm and paid back within 10 requests. */
-function shouldCompact(a: Advice): boolean {
-  return (a.kind === 'cold' && a.netNowUsd > 0) || (a.kind === 'warm' && a.paybackReqs <= 10)
+/** The surface the one-line texts are written for: the terminal when one draws, else the first. */
+async function lineSurface($: EngineInterface): Promise<Surface> {
+  const all = await $.session.surfaces()
+  return all.includes('terminal') || all.length === 0 ? 'terminal' : all[0]!
 }
 
 /** Re-reads the engine's figures into `view`; git too when asked (it spawns processes). */
 async function refresh($: EngineInterface, opts: Opts, withGit: boolean): Promise<void> {
-  const [usage, model, now, cwd] = await Promise.all([$.session.usage(), $.session.model(), $.clock.now(), $.session.cwd()])
+  const [usage, model, now, cwd, running] = await Promise.all([
+    $.session.usage(),
+    $.session.model(),
+    $.clock.now(),
+    $.session.cwd(),
+    agentsRunning($),
+  ])
   const rates: HudRate[] = usage.rateLimits.map(r => ({
     kind: r.kind,
     pct: r.percentUsed,
@@ -188,6 +155,7 @@ async function refresh($: EngineInterface, opts: Opts, withGit: boolean): Promis
   const auth = prior?.auth ?? (await $.session.authorize().then(a => (a ? a.kind : 'none')).catch(() => 'none' as const))
   const ttl = await resolveTtl($, opts, auth, rates)
   const git = withGit ? await readGit($) : undefined
+  const spend = await readSpend($, now)
   await update($, view, prev => ({
     now,
     model,
@@ -204,18 +172,16 @@ async function refresh($: EngineInterface, opts: Opts, withGit: boolean): Promis
     cwdLeaf: cwd.split(/[\\/]/).filter(Boolean).pop(),
     os: prev?.os,
     version: prev?.version,
+    agentsRunning: running,
+    spend,
   }))
   if (opts.display !== 'band') await pushStatus($)
   if (opts.alerts) await alert($, opts)
 }
 
 async function pushStatus($: EngineInterface): Promise<void> {
-  const v = await read($, view)
-  if (!v) return
-  const parts = [`ctx ${v.ctxPct ?? '--'}%`, modelLabel(v.model)]
-  for (const r of v.rates) parts.push(`${r.kind === 'five_hour' ? '5h' : r.kind === 'seven_day' ? '7d' : r.kind} ${r.pct}%`)
-  if (v.costUsd !== undefined) parts.push(fmtUsd(v.costUsd))
-  $.ui.status(parts.join(' · '))
+  const [v, l] = await Promise.all([read($, view), read($, ledger)])
+  if (v) $.ui.status(compactLine(v, l, await lineSurface($)))
 }
 
 /** Toasts each crossing once per session. */
@@ -236,9 +202,15 @@ async function alert($: EngineInterface, opts: Opts): Promise<void> {
   if (opts.budgetUsd > 0 && (v.costUsd ?? 0) >= opts.budgetUsd)
     due.push(['budget', `Session cost ${fmtUsd(v.costUsd ?? 0)} passed your ${fmtUsd(opts.budgetUsd)} budget.`])
   const cache = cacheState(l.last?.at, v.ttl, now)
-  if (cache.warm && cache.leftMs <= 60_000 && (v.ctxTokens ?? 0) >= 60_000) {
+  if (l.last && (v.ctxTokens ?? 0) >= 60_000) {
     const rewrite = spendOf({ in: 0, rd: 0, wr: v.ctxTokens ?? 0, out: 0 }, v.model, v.ttl).total
-    due.push([`cold:${l.last?.at}`, `Prompt cache goes cold in ${fmtDur(cache.leftMs)}: the next prompt after that re-writes ${fmtTok(v.ctxTokens ?? 0)} tokens (~${fmtUsd(rewrite)}).`])
+    if (cache.warm && cache.leftMs <= 60_000)
+      due.push([`cooling:${l.last.at}`, `Prompt cache goes cold in ${fmtDur(cache.leftMs)}: the next prompt after that re-writes ${fmtTok(v.ctxTokens ?? 0)} tokens (~${fmtUsd(rewrite)}).`])
+    else if (!cache.warm) {
+      const advice = adviceFor(v, l)
+      const tip = advice.kind === 'cold' && advice.netNowUsd > 0 ? ` /compact first is ~${fmtUsd(advice.netNowUsd)} cheaper.` : ''
+      due.push([`cold:${l.last.at}`, `Prompt cache went cold: the next prompt re-writes ${fmtTok(v.ctxTokens ?? 0)} tokens (~${fmtUsd(rewrite)}).${tip}`])
+    }
   }
   const fresh = due.filter(([key]) => !seen.includes(key))
   if (fresh.length === 0) return
@@ -250,10 +222,23 @@ async function storeKey($: EngineInterface): Promise<string> {
   return `ledger:${await $.session.id()}`
 }
 
-/** Keeps the ledger across reloads and resumes; only the newest sessions, so the store stays small. */
+/**
+ * Keeps the ledger across reloads and resumes (newest sessions only, so the store stays small)
+ * and adds what was priced since the last save to today's cross-session total.
+ */
 async function saveLedger($: EngineInterface): Promise<void> {
+  const [l, now] = await Promise.all([read($, ledger), $.clock.now()])
+  const spent = allUsd(l)
+  if (spent > l.savedUsd) {
+    const days = ((await $.store.get('days')) as Record<string, number> | undefined) ?? {}
+    const today = dayKey(now)
+    days[today] = (days[today] ?? 0) + (spent - l.savedUsd)
+    const keep = Object.keys(days).sort().slice(-KEEP_DAYS)
+    await $.store.set('days', Object.fromEntries(keep.map(k => [k, days[k]!])))
+  }
+  const saved = await update($, ledger, x => ({ ...x, savedUsd: spent }))
   const key = await storeKey($)
-  await $.store.set(key, await read($, ledger))
+  await $.store.set(key, saved)
   const index = ((await $.store.get('ledgers')) as string[] | undefined) ?? []
   const kept = [...index.filter(k => k !== key), key]
   for (const old of kept.slice(0, -KEEP_SESSIONS)) await $.store.delete(old)
@@ -263,10 +248,54 @@ async function saveLedger($: EngineInterface): Promise<void> {
 async function compactNow($: EngineInterface): Promise<void> {
   try {
     const r = await $.session.compact()
-    if (r && 'skip' in r && r.skip) $.ui.toast('Compaction skipped by a hook.')
+    if (r.skip !== undefined) $.ui.toast('Compaction skipped by a hook.')
   } catch {
     $.ui.toast('Compaction runs between turns: try again when the turn ends.')
   }
+}
+
+type Usage = { input_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number; output_tokens: number }
+
+/** Logs a main-conversation compaction: before/after, what the summarizer cost. */
+async function recordCompaction($: EngineInterface, opts: Opts, c: Omit<HudCompaction, 'usd' | 'at'>, usage: Usage | undefined): Promise<void> {
+  const [v, at] = await Promise.all([read($, view), $.clock.now()])
+  const usd = usage
+    ? spendOf(
+        { in: usage.input_tokens, rd: usage.cache_read_input_tokens, wr: usage.cache_creation_input_tokens, out: usage.output_tokens },
+        v?.model ?? '',
+        await resolveAgentTtl($),
+      ).total
+    : 0
+  await update($, ledger, l => ({ ...l, compactions: push(l.compactions, { ...c, usd, at }), compactedAt: at }))
+  if (opts.alerts && c.before !== undefined && c.after !== undefined && c.before > 0) {
+    const cut = Math.round((1 - c.after / c.before) * 100)
+    $.ui.toast(`Compacted ${fmtTok(c.before)} → ${fmtTok(c.after)} tokens (−${cut}%) for ${fmtUsd(usd)}.`, { timeoutMs: 6000 })
+  }
+}
+
+/** Books one main-loop response: ledger, the running turn, and a toast for an unexpected cache miss. */
+async function bookMain($: EngineInterface, opts: Opts, model: string, effort: string | undefined, t: { in: number; rd: number; wr: number; out: number }): Promise<void> {
+  const [v, l, at] = await Promise.all([read($, view), read($, ledger), $.clock.now()])
+  const ttl = v?.ttl ?? '5m'
+  const s = spendOf(t, model, ttl)
+  const ctx = t.in + t.rd + t.wr
+  const cause = missCause({ prev: l.last, cur: { model, rd: t.rd, wr: t.wr }, ttlMs: TTL_MS[ttl], now: at, compactedAt: l.compactedAt })
+  await update($, ledger, x => ({
+    ...x,
+    reqs: x.reqs + 1,
+    in: x.in + t.in, rd: x.rd + t.rd, wr: x.wr + t.wr, out: x.out + t.out,
+    usdIn: x.usdIn + s.in, usdRd: x.usdRd + s.rd, usdWr: x.usdWr + s.wr, usdOut: x.usdOut + s.out,
+    baseCtx: x.baseCtx ?? ctx,
+    last: { model, ...t, usd: s.total, at, effort },
+    ctxHistory: push(x.ctxHistory, ctx),
+    usdHistory: push(x.usdHistory, s.total),
+    misses: x.misses + (cause ? 1 : 0),
+    missUsd: x.missUsd + (cause ? s.wr : 0),
+  }))
+  await update($, turn, cur => (cur ? { ...cur, usd: cur.usd + s.total, reqs: cur.reqs + 1 } : cur))
+  await update($, view, prev => (prev ? { ...prev, effort } : prev))
+  if (cause && opts.alerts)
+    $.ui.toast(`Cache miss: re-wrote ${fmtTok(t.wr)} tokens (~${fmtUsd(s.wr)}) while the cache was warm. Likely cause: ${cause}.`, { timeoutMs: 8000 })
 }
 
 export const register: Register = (on, options) => {
@@ -282,10 +311,10 @@ export const register: Register = (on, options) => {
     await $.tool.register({
       name: 'usage',
       description:
-        "Live budget for this Claude Code session: context fill, rate-limit windows with pace projections, " +
-        'cost, prompt-cache warmth and whether /compact pays off now. Check before starting a large task.',
+        'Live budget for this Claude Code session: context fill, rate-limit windows with pace projections, ' +
+        'cost, prompt-cache warmth and misses, and whether /compact pays off now. Check before starting a large task.',
     })
-    const saved = (await $.store.get(await storeKey($))) as HudLedger | undefined
+    const saved = (await $.store.get(await storeKey($))) as Partial<HudLedger> | undefined
     if (saved && typeof saved.reqs === 'number') await update($, ledger, () => ({ ...EMPTY, ...saved }))
     const [os, version] = await Promise.all([osName($), $.session.version()])
     await refresh($, opts, true)
@@ -302,7 +331,14 @@ export const register: Register = (on, options) => {
     if (e.reason === 'clear') {
       await update($, ledger, () => EMPTY)
       await update($, fired, () => [])
+      await update($, turn, () => null)
     }
+    return next(e)
+  })
+
+  on('turn.start', async ($, e, next) => {
+    const v = await read($, view)
+    await update($, turn, () => ({ id: e.turnId, usd: 0, reqs: 0, startCtx: v?.ctxTokens }))
     return next(e)
   })
 
@@ -316,24 +352,10 @@ export const register: Register = (on, options) => {
       if (e.agentId !== undefined) {
         const s = spendOf(t, usage.model, await resolveAgentTtl($))
         await update($, ledger, l => ({ ...l, agentReqs: l.agentReqs + 1, agentUsd: l.agentUsd + s.total }))
+        await update($, turn, cur => (cur ? { ...cur, usd: cur.usd + s.total } : cur))
         return result
       }
-      const v = await read($, view)
-      const s = spendOf(t, usage.model, v?.ttl ?? '5m')
-      const at = await $.clock.now()
-      const ctx = t.in + t.rd + t.wr
-      const effort = e.effort === undefined ? undefined : String(e.effort)
-      await update($, ledger, l => ({
-        ...l,
-        reqs: l.reqs + 1,
-        in: l.in + t.in, rd: l.rd + t.rd, wr: l.wr + t.wr, out: l.out + t.out,
-        usdIn: l.usdIn + s.in, usdRd: l.usdRd + s.rd, usdWr: l.usdWr + s.wr, usdOut: l.usdOut + s.out,
-        baseCtx: l.baseCtx ?? ctx,
-        last: { model: usage.model, ...t, usd: s.total, at, effort },
-        ctxHistory: push(l.ctxHistory, ctx),
-        usdHistory: push(l.usdHistory, s.total),
-      }))
-      await update($, view, prev => (prev ? { ...prev, effort } : prev))
+      await bookMain($, opts, usage.model, e.effort === undefined ? undefined : String(e.effort), t)
       await refresh($, opts, false)
     } catch {
       // bookkeeping never gets in the way of the response
@@ -349,17 +371,28 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
-      await update($, ledger, l => ({ ...l, turnMs: push(l.turnMs, e.durationMs) }))
       await refresh($, opts, true)
+      const [cur, v] = await Promise.all([read($, turn), read($, view)])
+      const ctxDelta = cur?.startCtx !== undefined && v?.ctxTokens !== undefined ? v.ctxTokens - cur.startCtx : 0
+      await update($, ledger, l => ({ ...l, turns: push(l.turns, { durationMs: e.durationMs, usd: cur?.usd ?? 0, reqs: cur?.reqs ?? 0, ctxDelta }) }))
+      await update($, turn, () => null)
       await saveLedger($)
     }
     return next(e)
   })
 
+  // Observes compactions (the person's /compact, auto-compact, the HUD's button) without steering them.
+  on('session.compact', async ($, e, next) => {
+    const r = await next(e)
+    if (e.agentId === undefined && r.skip === undefined)
+      await recordCompaction($, opts, { before: r.tokensBefore, after: r.tokensAfter, trigger: String(e.trigger) }, r.usage)
+    return r
+  }).catch(($, e, next) => next(e))
+
   on('tool.call', { tool: 'mcp__statusline-hud__usage' }, async $ => {
     await refresh($, opts, false)
-    const [v, l, now] = await Promise.all([read($, view), read($, ledger), $.clock.now()])
-    return { result: v ? report(v, l, now) : 'No usage figures yet.' }
+    const [v, l] = await Promise.all([read($, view), read($, ledger)])
+    return { result: v ? report(v, l) : 'No usage figures yet.' }
   }).catch(() => ({ result: 'Usage figures are unavailable right now.' }))
 
   on('command.run', { command: 'hud' }, async ($, e) => {
@@ -370,8 +403,8 @@ export const register: Register = (on, options) => {
     }
     if (arg === 'status') {
       await refresh($, opts, true)
-      const [v, l, now] = await Promise.all([read($, view), read($, ledger), $.clock.now()])
-      return { text: v ? report(v, l, now) : 'No usage figures yet.' }
+      const [v, l] = await Promise.all([read($, view), read($, ledger)])
+      return { text: v ? report(v, l) : 'No usage figures yet.' }
     }
     if (arg === 'reset') {
       await update($, ledger, () => EMPTY)
@@ -385,12 +418,8 @@ export const register: Register = (on, options) => {
   // ---------- drawing ----------
 
   type Els = ReturnType<EngineInterface['ui']['resolve']>
-  type Seg = { t: string; c?: string; dim?: boolean; bold?: boolean }
 
-  const SEP: Seg = { t: ' · ', dim: true }
-  const join = (groups: Seg[][]): Seg[] => groups.filter(g => g.length > 0).flatMap((g, i) => (i === 0 ? g : [SEP, ...g]))
-
-  function Row(els: Els, segs: Seg[]) {
+  function Row(els: Els, segs: readonly Seg[]) {
     const { Box, Text } = els
     return (
       <Box flexDirection="row" flexWrap="wrap">
@@ -403,172 +432,67 @@ export const register: Register = (on, options) => {
     )
   }
 
-  function costBar(s: Spend, width: number): Seg[] {
-    const n = costSegments(s, width)
-    return [
-      { t: '█'.repeat(n.in), c: 'yellow' },
-      { t: '█'.repeat(n.rd), c: 'green' },
-      { t: '█'.repeat(n.wr), c: 'red' },
-      { t: '█'.repeat(n.out), c: 'magenta' },
-    ].filter(x => x.t.length > 0)
-  }
-
-  function tokenSegs(label: Seg, t: { in: number; rd: number; wr: number; out: number }, s: Spend, width: number): Seg[] {
-    return [
-      label,
-      { t: ` in:${fmtTok(t.in).padStart(6)}`, c: 'yellow' },
-      { t: ` cached:${fmtTok(t.rd).padStart(6)}`, c: 'green' },
-      { t: ` wr:${fmtTok(t.wr).padStart(6)}`, c: 'red' },
-      { t: ` out:${fmtTok(t.out).padStart(6)}`, c: 'magenta' },
-      { t: ' ≈', dim: true },
-      { t: fmtUsd(s.total).padStart(7) + ' ' },
-      ...costBar(s, width),
-    ]
-  }
-
-  function rateSegs(v: HudView): Seg[][] {
-    return v.rates.map(r => {
-      const label = r.kind === 'five_hour' ? '5h' : r.kind === 'seven_day' ? '7d' : r.kind
-      const o = outlook(r.pct, r.resetsAt, WINDOW_MS[r.kind], v.now)
-      const segs: Seg[] = [
-        { t: `${label}:`, dim: true },
-        { t: `${bar(r.pct, 8)} ${Math.round(r.pct)}%`, c: pctColor(r.pct) },
-      ]
-      if (o.resetsInMs !== undefined) segs.push({ t: `·${fmtDur(o.resetsInMs)}`, dim: true })
-      if (o.projected !== undefined) segs.push({ t: ' proj:', dim: true }, { t: `${o.projected}%`, c: projColor(o.projected) })
-      if (o.hitsLimitInMs !== undefined && r.pct < 100) segs.push({ t: ` ⚠ 100% in ${fmtDur(o.hitsLimitInMs)}`, c: 'error' })
-      return segs
-    })
-  }
-
-  function adviceSegs(a: Advice, cache: { warm: boolean; leftMs: number }): Seg[] {
-    const head: Seg = { t: 'cmp   ', c: 'cyan' }
-    if (a.kind === 'fresh') return [head, { t: 'fresh context', dim: true }]
-    if (a.kind === 'small') return [head, { t: 'context small, no benefit', dim: true }]
-    const shrink: Seg = { t: ` ${fmtTok(a.ctx)}→~${fmtTok(a.after)}`, dim: true }
-    const tail: Seg[] = []
-    if (a.cliff) tail.push({ t: ' >200k: recall degrades', c: 'error' })
-    if (a.nearAuto) tail.push({ t: ' auto-compact near', c: 'warning' })
-    if (a.kind === 'cold') {
-      const good = a.netNowUsd > 0
-      return [
-        head,
-        {
-          t: good
-            ? `cold, compact now: ~${fmtUsd(a.netNowUsd)} cheaper than resuming`
-            : `cold, compact costs ~${fmtUsd(-a.netNowUsd)} extra`,
-          c: good ? 'success' : 'warning',
-        },
-        { t: ` then saves ${fmtUsd(a.savesPerReq)}/req`, dim: true },
-        shrink,
-        ...tail,
-      ]
-    }
-    const nc = a.paybackReqs <= 10 ? 'success' : a.paybackReqs <= 30 ? 'warning' : undefined
-    return [
-      head,
-      { t: 'warm', dim: true },
-      { t: ` (cold in ${fmtDur(cache.leftMs)})`, dim: true },
-      { t: ' cost ', dim: true },
-      { t: fmtUsd(a.costUsd) },
-      { t: ' saves ', dim: true },
-      { t: `${fmtUsd(a.savesPerReq)}/req ` },
-      { t: `pays back in ${a.paybackReqs} req`, c: nc, dim: nc === undefined },
-      shrink,
-      ...tail,
-    ]
-  }
-
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (!showBand || e.props.hasSurvey) return next(e)
     const [v, l, hidden] = await Promise.all([read($, view), read($, ledger), read($, isHidden)])
     if (!v || hidden) return next(e)
     const els = $.ui.resolve(e)
     const { Box, Button } = els
-    const narrow = e.props.bodyColumns < 110
-    const barW = narrow ? 10 : 20
-    const now = v.now
-    const cache = cacheState(l.last?.at, v.ttl, now)
+    const rows = bandRows(v, l, {
+      surface: e.surface,
+      density: opts.density,
+      budgetUsd: opts.budgetUsd,
+      narrow: e.props.bodyColumns < 110,
+      clock: clockOf(v.now),
+    })
+    const compact = shouldCompact(adviceFor(v, l)) && !e.props.isWorking
+    const last = rows.length - 1
+    return (
+      <Box flexDirection="column">
+        {rows.map((segs, i) => {
+          const isAdvice = segs[0]?.t.startsWith('cmp') === true
+          const isLast = i === last
+          if (!(isAdvice && compact) && !isLast) return Row(els, segs)
+          return (
+            <Box flexDirection="row" gap={1}>
+              {Row(els, segs)}
+              {isAdvice && compact && <Button key="compact" label="Compact now" hotkey="c" variant="primary" onPress={() => compactNow($)} />}
+              {isLast && <Button key="pane" label="dashboard" hotkey="d" plain onPress={() => void $.ui.open({ id: PANE, title: 'Session HUD' })} />}
+              {isLast && <Button key="hide" label="hide" hotkey="h" plain onPress={() => update($, isHidden, () => true)} />}
+            </Box>
+          )
+        })}
+      </Box>
+    )
+  })
 
-    const ctxSegs: Seg[] =
-      v.ctxPct !== undefined
-        ? [
-            ...((v.ctxTokens ?? 0) > 200_000 ? [{ t: '⚠ ', c: 'error' }] : []),
-            { t: `ctx: ${v.ctxPct}% ${bar(v.ctxPct, 8)} [${fmtTok(v.ctxTokens ?? 0)}/${fmtTok(v.ctxWindow)}]`, c: (v.ctxTokens ?? 0) > 200_000 ? 'error' : pctColor(v.ctxPct) },
-          ]
-        : [{ t: 'ctx: --', dim: true }]
-    const modelSegs: Seg[] = [{ t: modelLabel(v.model), c: 'cyan', bold: true }]
-    if (v.effort) modelSegs.push({ t: ` [${v.effort}]`, c: v.effort === 'max' || v.effort === 'xhigh' ? 'error' : v.effort === 'high' ? 'warning' : undefined, dim: v.effort === 'low' || v.effort === 'medium' })
-    const line1 = join([ctxSegs, modelSegs, ...rateSegs(v)])
+  // While a turn runs: what it has cost so far, beside the engine's own elapsed time and tokens.
+  on('ui.render', { component: 'Spinner' }, async ($, e, next) => {
+    if (!opts.turnCost) return next(e)
+    const text = turnSoFar(await read($, turn))
+    return text ? next({ ...e, props: { ...e.props, suffix: `${e.props.suffix} ${text}` } }) : next(e)
+  })
 
-    const g = v.git
-    const gitSegs: Seg[] = g?.branch
-      ? [
-          { t: `⎇ ${g.branch}`, bold: true },
-          ...(g.ahead ? [{ t: ` ↑${g.ahead}`, c: 'cyan' }] : []),
-          ...(g.behind ? [{ t: ` ↓${g.behind}`, c: 'warning' }] : []),
-          ...(g.changed ? [{ t: ` ✎${g.changed}`, c: 'warning' }] : []),
-        ]
-      : []
-    const diffSegs: Seg[] = g && (g.added || g.removed) ? [{ t: `+${g.added}`, c: 'success' }, { t: '/', dim: true }, { t: `-${g.removed}`, c: 'error' }] : []
-    const costSegs: Seg[] =
-      v.costUsd !== undefined
-        ? [{ t: `cost:${fmtUsd(v.costUsd)}`, c: opts.budgetUsd > 0 && v.costUsd >= opts.budgetUsd ? 'error' : undefined }]
-        : []
-    const durSegs: Seg[] = v.startedAt ? [{ t: `⏱ ${fmtDur(now - v.startedAt)}`, dim: true }] : []
-    const cacheSegs: Seg[] = l.last
-      ? cache.warm
-        ? [{ t: `cache ${v.ttl} warm ${fmtDur(cache.leftMs)}`, c: cache.leftMs <= 60_000 ? 'warning' : 'success' }]
-        : [{ t: `cache ${v.ttl} cold`, c: 'subtle' }]
-      : []
-    const line2: Seg[] = [{ t: 'sess: ', c: 'cyan' }, ...join([gitSegs, diffSegs, v.cwdLeaf ? [{ t: v.cwdLeaf, dim: true }] : [], costSegs, durSegs, cacheSegs])]
+  // The line that closes a turn (terminal only; Desktop draws its own footer): what the turn cost.
+  on('ui.render', { component: 'TurnDuration' }, async ($, e, next) => {
+    if (!opts.turnCost) return next(e)
+    const done = (await read($, ledger)).turns.findLast(t => t.durationMs === e.props.durationMs)
+    if (!done || done.reqs === 0) return next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="row">
+        {await next(e)}
+        <Text dimColor> · {turnTail(done)}</Text>
+      </Box>
+    )
+  })
 
-    const rows = [Row(els, line1), Row(els, line2)]
-
-    if (opts.density === 'full') {
-      const t = totals(l)
-      if (l.reqs > 0) {
-        const hit = hitRatio(l)
-        rows.push(
-          Row(els, [
-            ...tokenSegs({ t: 'Σ    ', c: 'cyan' }, l, t, barW),
-            ...(hit !== undefined ? [SEP, { t: `hit ${Math.round(hit * 100)}%`, dim: true }] : []),
-            ...(l.agentReqs > 0 ? [SEP, { t: `agents ${fmtUsd(l.agentUsd)} (${l.agentReqs} req)`, dim: true }] : []),
-          ]),
-        )
-      }
-      if (l.last) {
-        const ls = spendOf(l.last, l.last.model, v.ttl)
-        rows.push(
-          Row(els, [
-            ...tokenSegs({ t: 'last ', dim: true }, l.last, ls, barW),
-            ...(l.ctxHistory.length > 1 ? [SEP, { t: 'ctx ', dim: true }, { t: spark(l.ctxHistory, 16, v.ctxWindow), c: 'cyan' }] : []),
-          ]),
-        )
-      }
-      const advice = adviceFor(v, l, now)
-      const adv = Row(els, adviceSegs(advice, cache))
-      rows.push(
-        shouldCompact(advice) && !e.props.isWorking ? (
-          <Box flexDirection="row" gap={1}>
-            {adv}
-            <Button key="compact" label="Compact now" hotkey="c" variant="primary" onPress={() => compactNow($)} />
-          </Box>
-        ) : (
-          adv
-        ),
-      )
-      const hh = new Date(now)
-      const clock = `${String(hh.getHours()).padStart(2, '0')}:${String(hh.getMinutes()).padStart(2, '0')}`
-      rows.push(
-        <Box flexDirection="row" gap={1}>
-          {Row(els, [{ t: '●', c: 'success' }, { t: ` ${v.os ?? ''}`, dim: true }, SEP, { t: `🕐 ${clock}`, dim: true }, ...(v.version ? [SEP, { t: `v${v.version}`, dim: true }] : [])])}
-          <Button key="pane" label="dashboard" hotkey="d" plain onPress={() => void $.ui.open({ id: PANE, title: 'Session HUD' })} />
-          <Button key="hide" label="hide" hotkey="h" plain onPress={() => update($, isHidden, () => true)} />
-        </Box>,
-      )
-    }
-    return <Box flexDirection="column">{rows}</Box>
+  // With the band hidden or compact, the hint line under the prompt carries the essentials (terminal draws `tail`).
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    if (e.surface !== 'terminal' || e.props.isDraft || opts.display !== 'band') return next(e)
+    const [v, l, hidden] = await Promise.all([read($, view), read($, ledger), read($, isHidden)])
+    if (!v || (!hidden && opts.density === 'full')) return next(e)
+    return next({ ...e, props: { ...e.props, tail: compactLine(v, l, 'terminal') } })
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -576,12 +500,13 @@ export const register: Register = (on, options) => {
     const { Box, Text, Button } = els
     const [v, l] = await Promise.all([read($, view), read($, ledger)])
     if (!v) return <Text dimColor>No usage figures yet: send a prompt.</Text>
+    const surface = e.surface
     const now = v.now
     const w = Math.max(20, Math.min(60, e.props.bodyColumns - 24))
     const t = totals(l)
     const hit = hitRatio(l)
     const cache = cacheState(l.last?.at, v.ttl, now)
-    const advice = adviceFor(v, l, now)
+    const advice = adviceFor(v, l)
     const hours = v.startedAt ? (now - v.startedAt) / 3_600_000 : 0
     const H = (title: string) => (
       <Text bold color="cyan">
@@ -590,61 +515,109 @@ export const register: Register = (on, options) => {
     )
     const share = (x: number) => (t.total > 0 ? `${Math.round((x / t.total) * 100)}%`.padStart(4) : '')
     const topTools = Object.entries(l.tools).sort((a, b) => b[1] - a[1]).slice(0, 8)
-    const avgTurn = l.turnMs.length ? l.turnMs.reduce((a, b) => a + b, 0) / l.turnMs.length : 0
+    const durations = l.turns.map(x => x.durationMs)
+    const avgTurn = durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : 0
+    const turnUsd = l.turns.map(x => x.usd)
+    const paceRows = v.rates
+      .map(r => ({ r, o: outlook(r.pct, r.resetsAt, WINDOW_MS[r.kind], now) }))
+      .filter(({ o }) => shows(surface, 'planUsage') || o.projected !== undefined)
 
     return (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="column">
           {H('Context')}
-          {Row(els, [{ t: bar(v.ctxPct ?? 0, w), c: pctColor(v.ctxPct ?? 0) }, { t: ` ${v.ctxPct ?? '--'}%  ${fmtTok(v.ctxTokens ?? 0)} / ${fmtTok(v.ctxWindow)}` }])}
+          {shows(surface, 'context') &&
+            Row(els, [{ t: bar(v.ctxPct ?? 0, w), c: pctColor(v.ctxPct ?? 0) }, { t: ` ${v.ctxPct ?? '--'}%  ${fmtTok(v.ctxTokens ?? 0)} / ${fmtTok(v.ctxWindow)}` }])}
           {l.ctxHistory.length > 1 && Row(els, [{ t: 'per request ', dim: true }, { t: spark(l.ctxHistory, w, v.ctxWindow), c: 'cyan' }])}
           {Row(els, [{ t: `kept by /compact ≈ ${fmtTok(l.baseCtx ?? 0)} (system prompt + tools)`, dim: true }])}
         </Box>
         <Box flexDirection="column">
           {H('Spend')}
-          {Row(els, [{ t: 'engine total ', dim: true }, { t: v.costUsd !== undefined ? fmtUsd(v.costUsd) : '?' }, { t: '   list-price estimate ', dim: true }, { t: fmtUsd(t.total) }, ...(hours > 0.05 ? [{ t: `   burn ${fmtUsd(t.total / hours)}/h`, dim: true }] : [])])}
+          {Row(els, [
+            { t: 'engine total ', dim: true },
+            { t: v.costUsd !== undefined ? fmtUsd(v.costUsd) : '?' },
+            { t: '   list-price estimate ', dim: true },
+            { t: fmtUsd(allUsd(l)) },
+            ...(hours > 0.05 ? [{ t: `   burn ${fmtUsd(allUsd(l) / hours)}/h`, dim: true }] : []),
+          ])}
           {Row(els, [{ t: `in      ${fmtTok(l.in).padStart(7)} ${fmtUsd(t.in).padStart(9)} ${share(t.in)}`, c: 'yellow' }])}
           {Row(els, [{ t: `cached  ${fmtTok(l.rd).padStart(7)} ${fmtUsd(t.rd).padStart(9)} ${share(t.rd)}`, c: 'green' }])}
           {Row(els, [{ t: `write   ${fmtTok(l.wr).padStart(7)} ${fmtUsd(t.wr).padStart(9)} ${share(t.wr)}`, c: 'red' }])}
           {Row(els, [{ t: `out     ${fmtTok(l.out).padStart(7)} ${fmtUsd(t.out).padStart(9)} ${share(t.out)}`, c: 'magenta' }])}
           {Row(els, costBar(t, w))}
           {l.usdHistory.length > 1 && Row(els, [{ t: '$/request ', dim: true }, { t: spark(l.usdHistory, w), c: 'magenta' }])}
-          {Row(els, [{ t: `${l.reqs} requests` + (hit !== undefined ? ` · cache hit ${Math.round(hit * 100)}%` : '') + (l.agentReqs ? ` · subagents ${fmtUsd(l.agentUsd)} over ${l.agentReqs} requests` : ''), dim: true }])}
-          {opts.budgetUsd > 0 && Row(els, [{ t: 'budget ', dim: true }, { t: bar(((v.costUsd ?? 0) / opts.budgetUsd) * 100, w), c: pctColor(((v.costUsd ?? 0) / opts.budgetUsd) * 100) }, { t: ` ${fmtUsd(opts.budgetUsd)}` }])}
+          {Row(els, [
+            {
+              t:
+                `${l.reqs} requests` +
+                (hit !== undefined ? ` · cache hit ${Math.round(hit * 100)}%` : '') +
+                (l.agentReqs ? ` · subagents ${fmtUsd(l.agentUsd)} over ${l.agentReqs} requests` : '') +
+                (v.agentsRunning ? ` (${v.agentsRunning} running)` : ''),
+              dim: true,
+            },
+          ])}
+          {v.spend && Row(els, [{ t: `today ${fmtUsd(v.spend.today)} · last 7 days ${fmtUsd(v.spend.week)} (all sessions, list price)`, dim: true }])}
+          {opts.budgetUsd > 0 &&
+            Row(els, [
+              { t: 'budget ', dim: true },
+              { t: bar(((v.costUsd ?? 0) / opts.budgetUsd) * 100, w), c: pctColor(((v.costUsd ?? 0) / opts.budgetUsd) * 100) },
+              { t: ` ${fmtUsd(opts.budgetUsd)}` },
+            ])}
         </Box>
-        {v.rates.length > 0 && (
+        {paceRows.length > 0 && (
           <Box flexDirection="column">
-            {H('Rate limits')}
-            {v.rates.map(r => {
-              const o = outlook(r.pct, r.resetsAt, WINDOW_MS[r.kind], now)
-              return Row(els, [
+            {H(shows(surface, 'planUsage') ? 'Rate limits' : 'Rate-limit pace')}
+            {paceRows.map(({ r, o }) =>
+              Row(els, [
                 { t: `${r.kind.padEnd(10)} `, dim: true },
-                { t: `${bar(r.pct, Math.min(w, 24))} ${r.pct}%`, c: pctColor(r.pct) },
+                ...(shows(surface, 'planUsage') ? [{ t: `${bar(r.pct, Math.min(w, 24))} ${r.pct}%`, c: pctColor(r.pct) }] : []),
                 ...(o.resetsInMs !== undefined ? [{ t: `  resets ${fmtDur(o.resetsInMs)}`, dim: true }] : []),
                 ...(o.projected !== undefined ? [{ t: '  pace → ', dim: true }, { t: `${o.projected}%`, c: projColor(o.projected) }] : []),
                 ...(o.hitsLimitInMs !== undefined && r.pct < 100 ? [{ t: `  100% in ${fmtDur(o.hitsLimitInMs)}`, c: 'error' }] : []),
-              ])
-            })}
+              ]),
+            )}
           </Box>
         )}
         <Box flexDirection="column">
           {H('Prompt cache & compaction')}
-          {Row(els, [{ t: `TTL ${v.ttl} · ` , dim: true }, l.last ? (cache.warm ? { t: `warm, cold in ${fmtDur(cache.leftMs)}`, c: 'success' } : { t: 'cold: next request re-writes the context', c: 'warning' }) : { t: 'no request yet', dim: true }])}
+          {Row(els, [
+            { t: `TTL ${v.ttl} · `, dim: true },
+            l.last ? (cache.warm ? { t: `warm, cold in ${fmtDur(cache.leftMs)}`, c: 'success' } : { t: 'cold: next request re-writes the context', c: 'warning' }) : { t: 'no request yet', dim: true },
+            ...(l.misses > 0 ? [{ t: ` · ${l.misses} unexpected miss${l.misses > 1 ? 'es' : ''} ~${fmtUsd(l.missUsd)}`, c: 'warning' }] : []),
+          ])}
           {Row(els, [{ t: adviceText(advice), c: shouldCompact(advice) ? 'success' : undefined }])}
+          {l.compactions.slice(-3).map(c =>
+            Row(els, [
+              { t: `compacted ${clockOf(c.at)} (${c.trigger}) `, dim: true },
+              { t: c.before !== undefined && c.after !== undefined ? `${fmtTok(c.before)} → ${fmtTok(c.after)} ` : '' },
+              { t: fmtUsd(c.usd), dim: true },
+            ]),
+          )}
         </Box>
-        {(topTools.length > 0 || l.turnMs.length > 0) && (
+        {(topTools.length > 0 || l.turns.length > 0) && (
           <Box flexDirection="column">
             {H('Activity')}
-            {l.turnMs.length > 0 && Row(els, [{ t: `${l.turnMs.length} turns · avg ${fmtDur(avgTurn)} · max ${fmtDur(Math.max(...l.turnMs))} `, dim: true }, { t: spark(l.turnMs, Math.min(w, 30)), c: 'cyan' }])}
+            {l.turns.length > 0 &&
+              Row(els, [
+                { t: `${l.turns.length} turns · avg ${fmtDur(avgTurn)} · max ${fmtDur(Math.max(...durations))} `, dim: true },
+                { t: spark(durations, Math.min(w, 30)), c: 'cyan' },
+              ])}
+            {turnUsd.some(x => x > 0) &&
+              Row(els, [{ t: `$/turn avg ${fmtUsd(turnUsd.reduce((a, b) => a + b, 0) / turnUsd.length)} `, dim: true }, { t: spark(turnUsd, Math.min(w, 30)), c: 'magenta' }])}
             {topTools.length > 0 && Row(els, [{ t: topTools.map(([n, c]) => `${n.replace(/^mcp__/, '')} ${c}`).join(' · '), dim: true }])}
           </Box>
         )}
         <Box flexDirection="row" gap={1}>
           <Button key="compact" label="Compact now" hotkey="c" variant={shouldCompact(advice) ? 'primary' : 'secondary'} onPress={() => compactNow($)} />
-          <Button key="copy" label="Copy report" hotkey="y" onPress={async press => {
-            const r = await $.ui.copy({ text: report(v, l, now), surface: press.surface })
-            $.ui.toast(r.isCopied ? 'HUD report copied.' : 'Copy not available here.')
-          }} />
+          <Button
+            key="copy"
+            label="Copy report"
+            hotkey="y"
+            onPress={async press => {
+              const r = await $.ui.copy({ text: report(v, l), surface: press.surface })
+              $.ui.toast(r.isCopied ? 'HUD report copied.' : 'Copy not available here.')
+            }}
+          />
           <Button key="close" label="Close" hotkey="x" role="dismiss" onPress={() => $.ui.close({ id: PANE })} />
         </Box>
       </Box>
