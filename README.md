@@ -14,6 +14,7 @@ This repo is a Claude Code plugin marketplace ([`.claude-plugin/marketplace.json
 
 ```
 /plugin install statusline-hud --marketplace rquintino/claude-code-xtras
+/plugin install flashcards --marketplace rquintino/claude-code-xtras
 /plugin install xtras-skills --marketplace rquintino/claude-code-xtras
 ```
 
@@ -22,6 +23,7 @@ Or from a shell: `claude plugin marketplace add rquintino/claude-code-xtras`, th
 | Plugin | What it is |
 | ------ | ---------- |
 | [statusline-hud](mods/statusline-hud/) | Mod: the status line below, rebuilt inside Claude Code with live per-request cost, rate-limit pace alerts, cache countdown, one-key compaction, a dashboard pane and a budget tool for the model |
+| [flashcards](mods/flashcards/) | Mod: software development flash cards on a side board, on any topic you pick, with got it / again spaced repetition |
 | xtras-skills | All the skills in the table below |
 
 ## Mods
@@ -31,6 +33,7 @@ Or from a shell: `claude plugin marketplace add rquintino/claude-code-xtras`, th
 | Mod | Description |
 | --- | ----------- |
 | [statusline-hud](mods/statusline-hud/) | Port of the [status line](statusline/) on steroids: band above the prompt, per-turn cost on the spinner and turn line, `/hud` dashboard pane, toasts when context, rate-limit pace, budget, cache expiry or an unexpected cache miss need attention, a compaction log, `[ Compact now ]` when the advisor says it pays off, and `mcp__statusline-hud__usage` so Claude can check its own budget. On Claude Code Desktop it leaves out what the Code tab already shows. |
+| [flashcards](mods/flashcards/) | Learn while Claude works: a `📇 cards 2 due · 5/12 learned` line under the band, and `f` (or `/cards [topic]`) opens a board of three cards that flip on a press. **Got it** climbs a 1d → 60d review ladder, **again** brings a card back in 10 minutes. Type any topic (Kubernetes, Rust lifetimes, OAuth…) or stay general. Cards are written by Haiku, three per call, only while the board is open. |
 
 ## Skills
 
@@ -40,7 +43,7 @@ Or from a shell: `claude plugin marketplace add rquintino/claude-code-xtras`, th
 | [plan-dotnet-app](skills/plan-dotnet-app/)   | Generate a build plan for .NET 10 Blazor Web Apps with Blazor Blueprint, EF Core, Playwright testing, and GitHub Actions CI. (from workshops)<br><br>If you want instead a ready to use starter repo see: https://github.com/rquintino/copilot-blazor-template |
 | [md2docx](skills/md2docx/)                   | The skill I use to convert markdown folders into word documents (ex. to share on my workshops, while we dont have markdown office standards 😉)                                                                                                                |
 | [pseudocode-rules](skills/pseudocode-rules/) | Write LLM instruction files (CLAUDE.md, agent policies, sandbox profiles) as compact pseudocode DSL — `deny()`/`allow()`/`require()` call sites with `# why` comments. Backed by recent research hinting  pseudocode > prose for instruction following.        |
-| [no-leak-mcq](skills/no-leak-mcq/)           | Generate or review four-option multiple-choice questions for answer leakage. Includes 18 checks covering position, length, language, specificity, punctuation, and answer-key patterns; manual content/style leak rules; and a stdlib-only validator. |
+| [no-leak-mcq](skills/no-leak-mcq/)           | Generate or review four-option multiple-choice questions for answer leakage. Includes 15 scored checks, answer-sequence diagnostics, independent random-key generation, manual content/style rules, and a stdlib-only validator. |
 
 
 ## Instructions
