@@ -1,0 +1,32 @@
+{
+  "name": "claude-code-xtras",
+  "description": "Skills, a status-line mod and Claude Code tooling from claude-code-xtras",
+  "owner": { "name": "Rui Quintino", "url": "https://github.com/rquintino" },
+  "plugins": [
+    {
+      "name": "statusline-hud",
+      "source": "./mods/statusline-hud",
+      "description": "Mod: live session HUD (context, rate-limit pace, per-request cost, cache countdown, compaction advisor, dashboard pane, budget tool for the model)",
+      "category": "productivity",
+      "keywords": ["statusline", "hud", "cost", "mod"]
+    },
+    {
+      "name": "xtras-skills",
+      "source": "./",
+      "description": "Skills: lisa-loop, plan-dotnet-app, md2docx, pseudocode-rules, no-leak-mcq",
+      "version": "0.1.0",
+      "author": { "name": "Rui Quintino" },
+      "license": "MIT",
+      "category": "productivity",
+      "keywords": ["skills"],
+      "strict": false,
+      "skills": [
+        "./skills/lisa-loop",
+        "./skills/plan-dotnet-app",
+        "./skills/md2docx",
+        "./skills/pseudocode-rules",
+        "./skills/no-leak-mcq"
+      ]
+    }
+  ]
+}

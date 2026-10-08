@@ -20,3 +20,7 @@ __pycache__/
 
 # Temp
 evals
+
+# Claude Code lays a mod's API types (and a tsconfig extending them) beside it on each load
+mods/*/.claude-plugin/types/
+mods/*/tsconfig.json

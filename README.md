@@ -8,6 +8,30 @@ A collection of AI agent skills, instruction, and Claude Code tooling I'm using 
 
 **Important: these assets and tools are shared as they exist on my profile, may need adjustment and further testing to make them work properly for you.**
 
+## Install as plugins
+
+This repo is a Claude Code plugin marketplace ([`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json)). At the prompt of a terminal session:
+
+```
+/plugin install statusline-hud --marketplace rquintino/claude-code-xtras
+/plugin install xtras-skills --marketplace rquintino/claude-code-xtras
+```
+
+Or from a shell: `claude plugin marketplace add rquintino/claude-code-xtras`, then `claude plugin install <plugin>@claude-code-xtras`.
+
+| Plugin | What it is |
+| ------ | ---------- |
+| [statusline-hud](mods/statusline-hud/) | Mod: the status line below, rebuilt inside Claude Code with live per-request cost, rate-limit pace alerts, cache countdown, one-key compaction, a dashboard pane and a budget tool for the model |
+| xtras-skills | All the skills in the table below |
+
+## Mods
+
+[Mods](https://code.claude.com/docs/en/plugins/mods/reference) are plugins of function hooks that run inside the Claude Code session (early-access API).
+
+| Mod | Description |
+| --- | ----------- |
+| [statusline-hud](mods/statusline-hud/) | Port of the [status line](statusline/) on steroids: band above the prompt, `/hud` dashboard pane, toasts when context, rate-limit pace, budget or prompt-cache expiry need attention, `[ Compact now ]` when the advisor says it pays off, and `mcp__statusline-hud__usage` so Claude can check its own budget. |
+
 ## Skills
 
 | Skill                                        | Description                                                                                                                                                                                                                                                    |
