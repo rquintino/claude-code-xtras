@@ -316,7 +316,7 @@ if [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && [ -n "$session_id" 
   cached_version=""
   [ -f "$tcache" ] && cached_mtime=$(awk -F= '/^mtime=/{print $2}' "$tcache")
   [ -f "$tcache" ] && cached_version=$(awk -F= '/^v=/{print $2}' "$tcache")
-  if [ -n "$tmtime" ] && [ "$tmtime" = "$cached_mtime" ] && [ "$cached_version" = "3" ]; then
+  if [ -n "$tmtime" ] && [ "$tmtime" = "$cached_mtime" ] && [ "$cached_version" = "4" ]; then
     sum_in=$(awk -F= '/^in=/{print $2}'  "$tcache")
     sum_rd=$(awk -F= '/^rd=/{print $2}'  "$tcache")
     sum_w5=$(awk -F= '/^w5=/{print $2}'  "$tcache")
@@ -329,11 +329,17 @@ if [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && [ -n "$session_id" 
     cost_out_raw=$(awk -F= '/^co=/{print $2}' "$tcache")
   else
     mapfile -t TS < <(jq -s '
-      # $/MTok — source: platform.claude.com/docs/en/about-claude/pricing (checked 2026-09-26)
-      # Cache reads: 0.1x input, except Fable/Mythos 5.1 (0.025x) and Opus 5.5 (0.05x).
+      # $/MTok — source: platform.claude.com/docs/en/about-claude/pricing (checked 2026-10-18)
+      # Cache reads: 0.1x input, except Fable/Mythos 5.1 (0.025x) and Opus 5.5 / Sonnet 5.5 (0.05x;
+      # Sonnet 5.5 launched at 0.1x and was cut permanently on 2026-10-07).
+      # Haiku 5.5 is priced by prompt length n (in + cache read + cache write): over 100k costs 5x.
       # Fast mode (Opus 5.5 / Opus 5 / Opus 4.8) = 2x on every category.
-      def price(m; speed):
+      def price(m; speed; n):
         (if   (m | test("opus-5-5"))            then {i:4,    w5:5,     w1:8,    r:0.20, o:20}
+         elif (m | test("sonnet-5-5"))          then {i:2,    w5:2.50,  w1:4,    r:0.10, o:10}
+         elif (m | test("haiku-5-5"))           then (if n > 100000
+                                                      then {i:0.50, w5:0.625, w1:1,    r:0.05, o:2.50}
+                                                      else {i:0.10, w5:0.125, w1:0.20, r:0.01, o:0.50} end)
          elif (m | test("(fable|mythos)-5-1"))  then {i:10,   w5:12.50, w1:20,   r:0.25, o:50}
          elif (m | test("(fable|mythos)-5"))    then {i:10,   w5:12.50, w1:20,   r:1.00, o:50}
          elif (m | test("opus-5|opus-4-[5-9]")) then {i:5,    w5:6.25,  w1:10,   r:0.50, o:25}
@@ -347,7 +353,8 @@ if [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && [ -n "$session_id" 
         | if speed == "fast" and (m | test("opus-5|opus-4-8")) then $p | map_values(. * 2) else $p end;
       map(select(.type == "assistant"))
       | group_by(.requestId)
-      | map(.[0] | {u: (.message.usage // {}), p: price(.message.model // ""; .message.usage.speed // "")})
+      | map(.[0] | {u: (.message.usage // {}), p: price(.message.model // ""; .message.usage.speed // "";
+          ((.message.usage.input_tokens // 0) + (.message.usage.cache_read_input_tokens // 0) + (.message.usage.cache_creation_input_tokens // 0)))})
       | reduce .[] as $x ({in:0, cached:0, w5:0, w1:0, out:0, ci:0, cr:0, cw5:0, cw1:0, co:0};
           ($x.u.input_tokens                             // 0) as $ti |
           ($x.u.cache_read_input_tokens                  // 0) as $tr |
@@ -376,7 +383,7 @@ if [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && [ -n "$session_id" 
     cost_w5_raw="${TS[7]:-0}"
     cost_w1_raw="${TS[8]:-0}"
     cost_out_raw="${TS[9]:-0}"
-    printf 'v=3\nmtime=%s\nin=%s\nrd=%s\nw5=%s\nw1=%s\nout=%s\nci=%s\ncr=%s\ncw5=%s\ncw1=%s\nco=%s\n' \
+    printf 'v=4\nmtime=%s\nin=%s\nrd=%s\nw5=%s\nw1=%s\nout=%s\nci=%s\ncr=%s\ncw5=%s\ncw1=%s\nco=%s\n' \
       "$tmtime" "$sum_in" "$sum_rd" "$sum_w5" "$sum_w1" "$sum_out" \
       "$cost_in_raw" "$cost_rd_raw" "$cost_w5_raw" "$cost_w1_raw" "$cost_out_raw" > "$tcache"
   fi
@@ -413,11 +420,16 @@ c_wr="\033[31m"    # red     — cache write (expensive)
 c_out="\033[35m"   # magenta — output
 cyan="\033[36m"
 
-# $/MTok for one model id — sets p_i p_w5 p_w1 p_r p_o. Same table as the jq price() above.
+# $/MTok for one model id (and its prompt length, for Haiku 5.5) — sets p_i p_w5 p_w1 p_r p_o.
+# Same table as the jq price() above.
 # Order matters: more specific ids first ('opus-5-5' before 'opus-5', 'fable-5-1' before 'fable-5').
 price_of() {
+  local n="${2:-0}"
   case "$1" in
     *opus-5-5*)                     set -- 4    5     8    0.20 20 ;;
+    *sonnet-5-5*)                   set -- 2    2.50  4    0.10 10 ;;
+    *haiku-5-5*) if [ "$n" -gt 100000 ]; then set -- 0.50 0.625 1 0.05 2.50
+                 else                         set -- 0.10 0.125 0.20 0.01 0.50; fi ;;
     *fable-5-1*|*mythos-5-1*)       set -- 10   12.50 20   0.25 50 ;;
     *fable-5*|*mythos-5*)           set -- 10   12.50 20   1.00 50 ;;
     *opus-5*|*opus-4-[5-9]*)        set -- 5    6.25  10   0.50 25 ;;
@@ -495,7 +507,7 @@ if [ "$sum_out" != "0" ] || [ "$sum_in" != "0" ] || [ "$sum_rd" != "0" ] || [ "$
 fi
 last_part=""
 if [ "$last_out" != "0" ] || [ "$last_in" != "0" ] || [ "$last_rd" != "0" ] || [ "$last_wr" != "0" ]; then
-  price_of "$model_id"
+  price_of "$model_id" "$(( last_in + last_rd + last_wr ))"
   lp_in=$p_i; lp_w=$p_w1; lp_rd=$p_r; lp_out=$p_o
   # The input JSON doesn't split cache_creation by 5m vs 1h — use the 1h rate as upper bound.
   l_cost_in=$(awk  "BEGIN { printf \"%.6f\", $last_in  * $lp_in  / 1000000 }")
@@ -503,8 +515,17 @@ if [ "$last_out" != "0" ] || [ "$last_in" != "0" ] || [ "$last_rd" != "0" ] || [
   l_cost_wr=$(awk  "BEGIN { printf \"%.6f\", $last_wr  * $lp_w   / 1000000 }")
   l_cost_out=$(awk "BEGIN { printf \"%.6f\", $last_out * $lp_out / 1000000 }")
   last_est=$(printf '$%6s' "$(fmt_num "$(awk "BEGIN { print $l_cost_in + $l_cost_rd + $l_cost_wr + $l_cost_out }")" 2)")
+  # last request cost as a background, green to red: <$0.05 green, <0.10 yellow-green,
+  # <0.20 yellow, <0.35 orange, <=0.50 orange-red, above 0.50 red (plus an alert after the bar)
+  l_total="$l_cost_in + $l_cost_rd + $l_cost_wr + $l_cost_out"
+  l_est_c=$(awk "BEGIN { t = $l_total
+    if (t > 0.50) print \"41\"; else if (t > 0.35) print \"48;5;202\"; else if (t > 0.20) print \"48;5;208\"
+    else if (t >= 0.10) print \"48;5;220\"; else if (t >= 0.05) print \"48;5;148\"; else print \"42\" }")
+  last_est="\033[1;30;${l_est_c}m${last_est}${reset}"
+  l_alert=""
+  awk "BEGIN { exit !($l_total > 0.50) }" && l_alert=" \033[1;31m"'⚠ request over $0.50'"${reset}"
   last_bar=$(make_cost_bar 20 "$l_cost_in" "$l_cost_rd" "$l_cost_wr" "$l_cost_out")
-  last_part="${dim}last ${reset} ${c_in}in:$(fmt_tok $last_in 6)${reset} ${c_cached}cached:$(fmt_tok $last_rd 6)${reset} ${c_wr}wr:$(fmt_tok $last_wr 6)${reset} ${c_out}out:$(fmt_tok $last_out 6)${reset} ${dim}≈${reset}${last_est} ${last_bar}"
+  last_part="${dim}last ${reset} ${c_in}in:$(fmt_tok $last_in 6)${reset} ${c_cached}cached:$(fmt_tok $last_rd 6)${reset} ${c_wr}wr:$(fmt_tok $last_wr 6)${reset} ${c_out}out:$(fmt_tok $last_out 6)${reset} ${dim}≈${reset}${last_est} ${last_bar}${l_alert}"
 fi
 
 # --- Compaction advisor: what /compact would cost and save, at API list prices ---
@@ -543,7 +564,7 @@ else
   S=$(( B + CMP_REATTACH ))
 
   if [ "$C" -ge "$CMP_MIN_CTX" ] && [ "$C" -gt "$S" ]; then
-    price_of "$model_id"
+    price_of "$model_id" "$C"
     [ "$pc_ttl" = "5m" ] && w=$p_w5 || w=$p_w1
     now=$(date +%s)
     cold=0

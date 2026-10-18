@@ -256,17 +256,32 @@ if ($rate_part) { $line1_parts += $rate_part }
 $line1 = $line1_parts -join $sep
 
 # --- Transcript aggregation (cumulative tokens + per-turn priced cost) ---
-function Price-Of([string]$m) {
-    # Cache reads: 0.025x on fable/mythos-5-1, 0.05x on opus-5-5, 0.1x elsewhere
-    if     ($m -match '(fable|mythos)-5-1') { return @{i=10; w5=12.50; w1=20; r=0.25; o=50} }
-    elseif ($m -match '(fable|mythos)-5')   { return @{i=10; w5=12.50; w1=20; r=1.00; o=50} }
-    elseif ($m -match 'opus-5-5')     { return @{i=4;  w5=5.00;  w1=8;  r=0.20; o=20} }
-    elseif ($m -match 'opus-5|opus-4-[5678]') { return @{i=5;  w5=6.25;  w1=10; r=0.50; o=25} }
-    elseif ($m -match 'opus-4')       { return @{i=15; w5=18.75; w1=30; r=1.50; o=75} }
-    elseif ($m -match 'sonnet-5')     { return @{i=2;  w5=2.50;  w1=4;  r=0.20; o=10} }
-    elseif ($m -match 'sonnet-4')     { return @{i=3;  w5=3.75;  w1=6;  r=0.30; o=15} }
-    elseif ($m -match 'haiku-4')      { return @{i=1;  w5=1.25;  w1=2;  r=0.10; o=5} }
-    else                              { return @{i=5;  w5=6.25;  w1=10; r=0.50; o=25} }
+# $/MTok — source: platform.claude.com/docs/en/about-claude/pricing (checked 2026-10-18)
+# Order matters: more specific ids first ('opus-5-5' before 'opus-5', 'fable-5-1' before 'fable-5').
+# Cache reads: 0.1x input, except Fable/Mythos 5.1 (0.025x) and Opus 5.5 / Sonnet 5.5 (0.05x;
+# Sonnet 5.5 launched at 0.1x and was cut permanently on 2026-10-07).
+# Haiku 5.5 is priced by prompt length $n (in + cache read + cache write): over 100k costs 5x.
+# Fast mode (Opus 5.5 / Opus 5 / Opus 4.8) = 2x on every category.
+function Price-Of([string]$m, [long]$n = 0, [string]$speed = '') {
+    if     ($m -match 'opus-5-5')            { $p = @{i=4;    w5=5;     w1=8;    r=0.20; o=20} }
+    elseif ($m -match 'sonnet-5-5')          { $p = @{i=2;    w5=2.50;  w1=4;    r=0.10; o=10} }
+    elseif ($m -match 'haiku-5-5') {
+        if ($n -gt 100000)                   { $p = @{i=0.50; w5=0.625; w1=1;    r=0.05; o=2.50} }
+        else                                 { $p = @{i=0.10; w5=0.125; w1=0.20; r=0.01; o=0.50} }
+    }
+    elseif ($m -match '(fable|mythos)-5-1')  { $p = @{i=10;   w5=12.50; w1=20;   r=0.25; o=50} }
+    elseif ($m -match '(fable|mythos)-5')    { $p = @{i=10;   w5=12.50; w1=20;   r=1.00; o=50} }
+    elseif ($m -match 'opus-5|opus-4-[5-9]') { $p = @{i=5;    w5=6.25;  w1=10;   r=0.50; o=25} }
+    elseif ($m -match 'opus-4')              { $p = @{i=15;   w5=18.75; w1=30;   r=1.50; o=75} }
+    elseif ($m -match 'sonnet-5')            { $p = @{i=2;    w5=2.50;  w1=4;    r=0.20; o=10} }
+    elseif ($m -match 'sonnet-4')            { $p = @{i=3;    w5=3.75;  w1=6;    r=0.30; o=15} }
+    elseif ($m -match 'haiku-4')             { $p = @{i=1;    w5=1.25;  w1=2;    r=0.10; o=5} }
+    elseif ($m -match 'haiku-3-5')           { $p = @{i=0.80; w5=1;     w1=1.60; r=0.08; o=4} }
+    else                                     { $p = @{i=5;    w5=6.25;  w1=10;   r=0.50; o=25} }
+    if ($speed -eq 'fast' -and $m -match 'opus-5|opus-4-8') {
+        foreach ($k in @($p.Keys)) { $p[$k] = $p[$k] * 2 }
+    }
+    return $p
 }
 
 $sum_in = 0L; $sum_rd = 0L; $sum_w5 = 0L; $sum_w1 = 0L; $sum_out = 0L
@@ -286,7 +301,7 @@ if ($transcript_path -and (Test-Path -LiteralPath $transcript_path) -and $sessio
         foreach ($ln in Get-Content -LiteralPath $tcache) {
             if ($ln -match '^([^=]+)=(.*)$') { $kv[$matches[1]] = $matches[2] }
         }
-        if ($kv['v'] -eq '2' -and $kv['mtime'] -eq $tmtime) {
+        if ($kv['v'] -eq '3' -and $kv['mtime'] -eq $tmtime) {
             $sum_in       = [long]$kv['in']
             $sum_rd       = [long]$kv['rd']
             $sum_w5       = [long]$kv['w5']
@@ -312,9 +327,9 @@ if ($transcript_path -and (Test-Path -LiteralPath $transcript_path) -and $sessio
             if ($rid) { $seen[$rid] = $true }
             $u = $obj.message.usage
             if ($null -eq $u) { continue }
-            $p = Price-Of ([string]$obj.message.model)
             $ti = [long](Get-Prop $u 'input_tokens' 0)
             $tr = [long](Get-Prop $u 'cache_read_input_tokens' 0)
+            $p = Price-Of ([string]$obj.message.model) ($ti + $tr + [long](Get-Prop $u 'cache_creation_input_tokens' 0)) ([string](Get-Prop $u 'speed' ''))
             $t5 = [long](Get-Prop $u 'cache_creation.ephemeral_5m_input_tokens' 0)
             $t1 = [long](Get-Prop $u 'cache_creation.ephemeral_1h_input_tokens' 0)
             $to = [long](Get-Prop $u 'output_tokens' 0)
@@ -330,7 +345,7 @@ if ($transcript_path -and (Test-Path -LiteralPath $transcript_path) -and $sessio
             $cost_out_raw += ($to * $p.o)
         }
         $cache_lines = @(
-            "v=2",
+            "v=3",
             "mtime=$tmtime",
             "in=$sum_in", "rd=$sum_rd", "w5=$sum_w5", "w1=$sum_w1", "out=$sum_out",
             "ci=$cost_in_raw", "cr=$cost_rd_raw", "cw5=$cost_w5_raw", "cw1=$cost_w1_raw", "co=$cost_out_raw"
@@ -407,26 +422,24 @@ if ($sum_out -ne 0 -or $sum_in -ne 0 -or $sum_rd -ne 0 -or $sum_wr -ne 0) {
 # --- Last-call breakdown ---
 $last_part = ''
 if ($last_out -ne 0 -or $last_in -ne 0 -or $last_rd -ne 0 -or $last_wr -ne 0) {
-    # switch -Regex falls through ALL matching cases — break is required, otherwise
-    # 'opus-4-7' matches 'opus-4-[567]' AND 'opus-4' and the legacy price wins.
-    switch -Regex ($model_id) {
-        '(fable|mythos)-5-1'    { $lp_in=10; $lp_w=20; $lp_rd=0.25; $lp_out=50; break }
-        '(fable|mythos)-5'      { $lp_in=10; $lp_w=20; $lp_rd=1.00; $lp_out=50; break }
-        'opus-5-5'              { $lp_in=4;  $lp_w=8;  $lp_rd=0.20; $lp_out=20; break }
-        'opus-5|opus-4-[5678]'  { $lp_in=5;  $lp_w=10; $lp_rd=0.50; $lp_out=25; break }
-        'opus-4'       { $lp_in=15; $lp_w=30; $lp_rd=1.50; $lp_out=75; break }
-        'sonnet-5'     { $lp_in=2;  $lp_w=4;  $lp_rd=0.20; $lp_out=10; break }
-        'sonnet-4'     { $lp_in=3;  $lp_w=6;  $lp_rd=0.30; $lp_out=15; break }
-        'haiku-4'      { $lp_in=1;  $lp_w=2;  $lp_rd=0.10; $lp_out=5;  break }
-        default        { $lp_in=5;  $lp_w=10; $lp_rd=0.50; $lp_out=25 }
-    }
+    # The input JSON doesn't split cache_creation by 5m vs 1h — use the 1h rate as upper bound.
+    $lp = Price-Of $model_id ($last_in + $last_rd + $last_wr)
+    $lp_in = $lp.i; $lp_w = $lp.w1; $lp_rd = $lp.r; $lp_out = $lp.o
     $l_ci = $last_in  * $lp_in  / 1000000.0
     $l_cr = $last_rd  * $lp_rd  / 1000000.0
     $l_cw = $last_wr  * $lp_w   / 1000000.0
     $l_co = $last_out * $lp_out / 1000000.0
     $last_est = '$' + ('{0,6:F2}' -f ($l_ci + $l_cr + $l_cw + $l_co))
+    # last request cost as a background, green to red: <$0.05 green, <0.10 yellow-green,
+    # <0.20 yellow, <0.35 orange, <=0.50 orange-red, above 0.50 red (plus an alert after the bar)
+    $l_total = $l_ci + $l_cr + $l_cw + $l_co
+    $l_est_c = if     ($l_total -gt 0.50)  { '41' }       elseif ($l_total -gt 0.35)  { '48;5;202' }
+               elseif ($l_total -gt 0.20)  { '48;5;208' } elseif ($l_total -ge 0.10) { '48;5;220' }
+               elseif ($l_total -ge 0.05) { '48;5;148' } else                       { '42' }
+    $last_est = "$e[1;30;${l_est_c}m$last_est${reset}"
+    $l_alert = if ($l_total -gt 0.50) { " $e[1;31m" + '⚠ request over $0.50' + $reset } else { '' }
     $last_bar = Make-CostBar 20 $l_ci $l_cr $l_cw $l_co
-    $last_part = "${dim}last ${reset} ${c_in}in:$(Fmt-Tok $last_in 6)${reset} ${c_cached}cached:$(Fmt-Tok $last_rd 6)${reset} ${c_wr}wr:$(Fmt-Tok $last_wr 6)${reset} ${c_out}out:$(Fmt-Tok $last_out 6)${reset} ${dim}≈${reset}${last_est} ${last_bar}"
+    $last_part = "${dim}last ${reset} ${c_in}in:$(Fmt-Tok $last_in 6)${reset} ${c_cached}cached:$(Fmt-Tok $last_rd 6)${reset} ${c_wr}wr:$(Fmt-Tok $last_wr 6)${reset} ${c_out}out:$(Fmt-Tok $last_out 6)${reset} ${dim}≈${reset}${last_est} ${last_bar}${l_alert}"
 }
 
 # --- Compaction advisor: what /compact would cost and save, at API list prices ---
@@ -475,8 +488,8 @@ if (-not $has_cur_usage) {
     $S = $B + $CMP_REATTACH
 
     if ($C -ge $CMP_MIN_CTX -and $C -gt $S) {
-        $p = Price-Of $model_id
-        $w = if ($pc_ttl -eq '5m') { $p.w5 } else { $p.w1 }
+        $p = Price-Of $model_id $C
+        $w =if ($pc_ttl -eq '5m') { $p.w5 } else { $p.w1 }
         $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         $cold = $false
         if ($pc_warm -eq $false) { $cold = $true }
